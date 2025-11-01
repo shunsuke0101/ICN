@@ -137,9 +137,9 @@ def main():
     print(f"実行日時: {datetime.now().strftime('%Y/%m/%d %H:%M:%S')}")
     print()
     
-    # ログファイルを削除
-    print("--- ログファイルのクリーンアップ ---")
-    clean_log_files()
+    # ログファイルを削除（CSV出力を停止したためコメントアウト）
+    # print("--- ログファイルのクリーンアップ ---")
+    # clean_log_files()
     
     # 環境変数の読み込み
     load_dotenv()

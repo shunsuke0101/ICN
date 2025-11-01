@@ -361,7 +361,7 @@ class IncheonCargoScraper:
     
     # ======================================================================================#
     # @method name:   scrape
-    def scrape(self, date_str=None, airport='NGO', output_format='csv', save_html=False):
+    def scrape(self, date_str=None, airport='NGO', output_format=None, save_html=False):
         """
         ---------------------------------------------------------------------
         メソッド概要： 貨物スケジュールをスクレイピング
@@ -458,7 +458,7 @@ class IncheonCargoScraper:
     
     # ======================================================================================#
     # @method name:   scrape_multiple_dates
-    def scrape_multiple_dates(self, start_date, end_date, airport='NGO', output_format='csv'):
+    def scrape_multiple_dates(self, start_date, end_date, airport='NGO', output_format=None):
         """
         ---------------------------------------------------------------------
         メソッド概要: 複数日のデータをスクレイピング
