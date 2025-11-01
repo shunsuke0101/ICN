@@ -1,17 +1,17 @@
-# 仁川国際空港 貨物出発時刻表スクレイピングプログラム
+# 仁川国際空港 貨物出発・到着時刻表スクレイピングプログラム
 
-仁川国際空港の貨物出発時刻表をスクレイピングして、CSV、JSON、Excelファイルとして保存するPythonプログラムです。
+仁川国際空港の貨物出発・到着時刻表をスクレイピングして、CSV、JSON、Excelファイルとして保存するPythonプログラムです。
 
 ## 機能
 
-- 指定した日付の貨物出発スケジュールを取得
+- 指定した日付の貨物出発・到着スケジュールを取得
 - 複数日のデータを一括取得
 - CSV、JSON、Excel形式での出力に対応
 - 空港コードを指定可能
 - Discord Webhookへの通知機能
 - **定期実行機能**
-  - 毎日22時に7日分のデータをすべて通知
-  - 1時間ごとに変更をチェックし、変更があった場合のみ通知
+  - 毎日22時に7日分のデータ（出発便・到着便）をすべて通知
+  - 1時間ごとに変更をチェックし、変更があった場合のみ通知（出発便・到着便を個別に検出）
 
 ## 必要な環境
 
@@ -35,22 +35,53 @@ from incheon_cargo_scraper import IncheonCargoScraper
 # スクレイパーのインスタンスを作成
 scraper = IncheonCargoScraper()
 
-# 今日のデータを取得してCSVで保存
-df = scraper.scrape(output_format='csv')
+# 今日の出発便データを取得してCSVで保存
+df_departure = scraper.scrape(output_format='csv', flight_type='departure')
+
+# 今日の到着便データを取得してCSVで保存
+df_arrival = scraper.scrape(output_format='csv', flight_type='arrival')
 ```
 
 ### 特定の日付のデータを取得
 
 ```python
-# 2024年11月29日のデータを取得
-df = scraper.scrape(date_str='20241129', airport='NGO', output_format='json')
+# 2024年11月29日の出発便データを取得
+df_departure = scraper.scrape(
+    date_str='20241129', 
+    airport='NGO', 
+    output_format='json',
+    flight_type='departure'
+)
+
+# 2024年11月29日の到着便データを取得
+df_arrival = scraper.scrape(
+    date_str='20241129', 
+    airport='NGO', 
+    output_format='json',
+    flight_type='arrival'
+)
 ```
 
 ### 複数日のデータを一括取得
 
 ```python
-# 2024年12月1日から7日までのデータを取得
-df = scraper.scrape_multiple_dates('20241201', '20241207', airport='NGO', output_format='excel')
+# 2024年12月1日から7日までの出発便データを取得
+df_departure = scraper.scrape_multiple_dates(
+    '20241201', 
+    '20241207', 
+    airport='NGO', 
+    output_format='excel',
+    flight_type='departure'
+)
+
+# 2024年12月1日から7日までの到着便データを取得
+df_arrival = scraper.scrape_multiple_dates(
+    '20241201', 
+    '20241207', 
+    airport='NGO', 
+    output_format='excel',
+    flight_type='arrival'
+)
 ```
 
 ### コマンドラインから実行
@@ -114,19 +145,40 @@ today = datetime.now()
 start_date = today.strftime('%Y%m%d')
 end_date = (today + timedelta(days=6)).strftime('%Y%m%d')
 
-df = scraper.scrape_multiple_dates(start_date, end_date, airport='NGO', output_format='csv')
+# 出発便データを取得
+df_departure = scraper.scrape_multiple_dates(
+    start_date, 
+    end_date, 
+    airport='NGO', 
+    flight_type='departure'
+)
 
-# Discordに通知
-scraper.send_discord_notification(df, start_date, end_date, 'NGO')
+# 到着便データを取得
+df_arrival = scraper.scrape_multiple_dates(
+    start_date, 
+    end_date, 
+    airport='NGO', 
+    flight_type='arrival'
+)
+
+# Discordに通知（出発便）
+scraper.send_discord_notification(df_departure, start_date, end_date, 'NGO', flight_type='departure')
+
+# Discordに通知（到着便）
+scraper.send_discord_notification(df_arrival, start_date, end_date, 'NGO', flight_type='arrival')
 ```
 
 ### 定期実行機能
 
-#### 1. 毎日22時に7日分のデータをすべて通知
+#### 1. 毎日22時に7日分のデータ（出発便・到着便）をすべて通知
 
 ```powershell
 python daily_notify.py
 ```
+
+- 出発便と到着便の両方のデータを取得
+- それぞれ個別にDiscord通知を送信
+- キャッシュファイルを別々に保存（`last_data_cache.json`と`last_data_cache_arrival.json`）
 
 このスクリプトは毎日22時に実行することで、その日から7日分のフライトスケジュールをすべてDiscordに通知します。
 
@@ -137,6 +189,11 @@ python hourly_check.py
 ```
 
 このスクリプトは1時間ごとに実行され、前回のデータと比較して変更があった場合のみDiscordに通知します。
+
+- 出発便と到着便の両方を個別にチェック
+- それぞれの変更を独立して検出
+- 変更があったフライトタイプのみ通知
+- キャッシュファイルを別々に管理（`last_data_cache.json`と`last_data_cache_arrival.json`）
 
 #### Windowsタスクスケジューラーで自動実行
 
@@ -173,14 +230,24 @@ python run_hourly_check.py
 
 - `date_str` (str, optional): 日付 (YYYYMMDD形式)。Noneの場合は今日の日付
 - `airport` (str, optional): 空港コード (デフォルト: 'NGO')
-- `output_format` (str, optional): 出力形式 ('csv', 'json', 'excel')
+- `output_format` (str, optional): 出力形式 ('csv', 'json', 'excel')。Noneの場合は保存しない
+- `flight_type` (str, optional): フライトタイプ ('departure' または 'arrival')。デフォルト: 'departure'
 
 ### scrape_multiple_dates() メソッド
 
 - `start_date` (str): 開始日 (YYYYMMDD形式)
 - `end_date` (str): 終了日 (YYYYMMDD形式)
 - `airport` (str, optional): 空港コード (デフォルト: 'NGO')
-- `output_format` (str, optional): 出力形式 ('csv', 'json', 'excel')
+- `output_format` (str, optional): 出力形式 ('csv', 'json', 'excel')。Noneの場合は保存しない
+- `flight_type` (str, optional): フライトタイプ ('departure' または 'arrival')。デフォルト: 'departure'
+
+### send_discord_notification() メソッド
+
+- `df` (pd.DataFrame): 送信するデータ
+- `start_date` (str): 開始日 (YYYYMMDD形式)
+- `end_date` (str): 終了日 (YYYYMMDD形式)
+- `airport` (str, optional): 空港コード (デフォルト: 'NGO')
+- `flight_type` (str, optional): フライトタイプ ('departure' または 'arrival')。デフォルト: 'departure'
 
 ## 空港コード例
 

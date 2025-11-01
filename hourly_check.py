@@ -4,14 +4,16 @@
 # @brief          仁川国際空港 貨物スケジュール 時間ごと変更検知システム
 # @author         GitHub Copilot
 # @date           2025/11/01
-# $Version:       1.00
-# $Revision:      2025/11/01 - 初期実装
+# $Version:       1.01
+# $Revision:      2025/11/01 - 到着便対応追加
 # @note           1時間ごとに実行し、前回データとの差分を検出してDiscord通知
+#                 出発便・到着便それぞれ独立して変更を検出
 #                 変更がない場合は通知をスキップすることで無駄な通知を削減
 # @attention      Windows Task Schedulerで1時間ごとに実行される想定
-#                 last_data_cache.jsonに前回データを保存し、差分検出に使用
+#                 last_data_cache.jsonとlast_data_cache_arrival.jsonに前回データを保存
 # @par            History
 #                 v1.00 (2025/11/01) - 初期実装・NaN値正規化対応
+#                 v1.01 (2025/11/01) - 到着便データ取得・変更検出機能追加
 # Copyright (c) 2025. All Rights reserved.
 #
 # -----------------------------------------------------------------------------------#
@@ -35,6 +37,7 @@ if not LOG_DIR.exists():
 
 # 前回データを保存するファイル
 CACHE_FILE = LOG_DIR / 'last_data_cache.json'
+CACHE_FILE_ARRIVAL = LOG_DIR / 'last_data_cache_arrival.json'
 
 
 # ======================================================================================#
@@ -52,6 +55,10 @@ def load_previous_data():
     ---------------------------------------------------------------------
     Returns:
         list or None: 前回取得したデータ（辞書のリスト）、失敗時はNone
+    ---------------------------------------------------------------------
+    Notes:
+        - author         GitHub Copilot
+        - revision       v1.00 (2025/11/01) - 初期実装
     ---------------------------------------------------------------------
     """
     if CACHE_FILE.exists():
@@ -81,6 +88,10 @@ def save_current_data(data):
     ---------------------------------------------------------------------
     Returns:
         なし
+    ---------------------------------------------------------------------
+    Notes:
+        - author         GitHub Copilot
+        - revision       v1.00 (2025/11/01) - 初期実装
     ---------------------------------------------------------------------
     """
     try:
@@ -124,6 +135,10 @@ def normalize_value(value):
     Returns:
         正規化された値（NaN系の値はNone、それ以外はそのまま）
     ---------------------------------------------------------------------
+    Notes:
+        - author         GitHub Copilot
+        - revision       v1.00 (2025/11/01) - 初期実装
+    ---------------------------------------------------------------------
     """
     import math
     # 文字列"NaN"もNoneに変換
@@ -152,6 +167,10 @@ def compare_data(previous, current):
     ---------------------------------------------------------------------
     Returns:
         tuple: (変更有無(bool), 変更内容の説明(str))
+    ---------------------------------------------------------------------
+    Notes:
+        - author         GitHub Copilot
+        - revision       v1.00 (2025/11/01) - 初期実装
     ---------------------------------------------------------------------
     """
     if previous is None:
@@ -240,8 +259,8 @@ def compare_data(previous, current):
 def main():
     """
     ---------------------------------------------------------------------
-    関数概要: メイン処理 - 1時間ごとのチェック
-    - 7日分のデータを取得
+    関数概要：  メイン処理 - 1時間ごとのチェック
+    - 7日分のデータ（出発便・到着便）を取得
     - 前回データと比較
     - 変更があった場合のみDiscordに通知
     ----------------------------------------------------------------------
@@ -250,6 +269,10 @@ def main():
     ---------------------------------------------------------------------
     Returns:
         なし (終了コードをsys.exitで返す)
+    ---------------------------------------------------------------------
+    Notes:
+        - author         GitHub Copilot
+        - revision       v1.01 (2025/11/01) - 到着便対応追加
     ---------------------------------------------------------------------
     """
     
@@ -278,39 +301,116 @@ def main():
     # スクレイパーを初期化
     scraper = IncheonCargoScraper()
     
-    # 7日分のデータを取得
-    df = scraper.scrape_multiple_dates(
+    # 出発便データを取得
+    print("\n【出発便データ取得】")
+    print("=" * 60)
+    df_departure = scraper.scrape_multiple_dates(
         start_date=start_date,
         end_date=end_date,
         airport='NGO',
-        output_format=None
+        output_format=None,
+        flight_type='departure'
     )
     
-    if df is None or len(df) == 0:
+    # 到着便データを取得
+    print("\n【到着便データ取得】")
+    print("=" * 60)
+    df_arrival = scraper.scrape_multiple_dates(
+        start_date=start_date,
+        end_date=end_date,
+        airport='NGO',
+        output_format=None,
+        flight_type='arrival'
+    )
+    
+    # データの確認
+    has_departure_data = df_departure is not None and len(df_departure) > 0
+    has_arrival_data = df_arrival is not None and len(df_arrival) > 0
+    
+    if not has_departure_data and not has_arrival_data:
         print("\n! データが取得できませんでした")
         sys.exit(1)
     
-    # DataFrameを辞書のリストに変換
-    current_data = df.to_dict('records')
+    # 変更検出フラグ
+    has_changes_overall = False
     
-    # 前回のデータを読み込む
-    print("\n前回データとの比較中...")
-    previous_data = load_previous_data()
+    # 出発便の変更チェック
+    if has_departure_data:
+        current_data_departure = df_departure.to_dict('records')
+        print("\n【出発便】前回データとの比較中...")
+        previous_data_departure = load_previous_data()
+        has_changes_dep, change_summary_dep = compare_data(previous_data_departure, current_data_departure)
+        print(f"出発便比較結果: {change_summary_dep}")
+        has_changes_overall = has_changes_overall or has_changes_dep
     
-    # データを比較
-    has_changes, change_summary = compare_data(previous_data, current_data)
+    # 到着便の変更チェック
+    if has_arrival_data:
+        current_data_arrival = df_arrival.to_dict('records')
+        print("\n【到着便】前回データとの比較中...")
+        # 到着便用のキャッシュファイルから読み込み
+        if CACHE_FILE_ARRIVAL.exists():
+            try:
+                with open(CACHE_FILE_ARRIVAL, 'r', encoding='utf-8') as f:
+                    previous_data_arrival = json.load(f)
+            except Exception as e:
+                print(f"警告: 到着便キャッシュファイルの読み込みに失敗 - {e}")
+                previous_data_arrival = None
+        else:
+            previous_data_arrival = None
+        
+        has_changes_arr, change_summary_arr = compare_data(previous_data_arrival, current_data_arrival)
+        print(f"到着便比較結果: {change_summary_arr}")
+        has_changes_overall = has_changes_overall or has_changes_arr
     
-    print(f"\n比較結果: {change_summary}")
-    
-    if has_changes:
+    if has_changes_overall:
         print("\n変更が検出されました。Discordに通知を送信します...")
         
-        # Discordに通知
-        success = scraper.send_discord_notification(df, start_date, end_date, 'NGO')
+        success_departure = False
+        success_arrival = False
+        
+        # 出発便の通知
+        if has_departure_data and has_changes_dep:
+            print("\n【出発便の通知送信】")
+            success_departure = scraper.send_discord_notification(
+                df_departure, start_date, end_date, 'NGO', flight_type='departure'
+            )
+        
+        # 到着便の通知
+        if has_arrival_data and has_changes_arr:
+            print("\n【到着便の通知送信】")
+            success_arrival = scraper.send_discord_notification(
+                df_arrival, start_date, end_date, 'NGO', flight_type='arrival'
+            )
+        
+        success = success_departure or success_arrival
         
         if success:
             # 成功したら現在のデータを保存
-            save_current_data(current_data)
+            if has_departure_data:
+                save_current_data(current_data_departure)
+            if has_arrival_data:
+                # 到着便データを別ファイルに保存
+                try:
+                    cleaned_data = []
+                    for item in current_data_arrival:
+                        cleaned_item = {}
+                        for key, value in item.items():
+                            if isinstance(value, float):
+                                import math
+                                if math.isnan(value):
+                                    cleaned_item[key] = None
+                                else:
+                                    cleaned_item[key] = value
+                            else:
+                                cleaned_item[key] = value
+                        cleaned_data.append(cleaned_item)
+                    
+                    with open(CACHE_FILE_ARRIVAL, 'w', encoding='utf-8') as f:
+                        json.dump(cleaned_data, f, ensure_ascii=False, indent=2)
+                    print(f"  到着便データをキャッシュに保存: {CACHE_FILE_ARRIVAL}")
+                except Exception as e:
+                    print(f"警告: 到着便キャッシュファイルの保存に失敗 - {e}")
+            
             print("\n" + "=" * 60)
             print("✓ 変更を検出し、通知を送信しました")
             print("=" * 60)
@@ -321,7 +421,29 @@ def main():
     else:
         print("\n変更がないため、通知をスキップします")
         # 変更がなくても現在のデータを保存（次回比較用）
-        save_current_data(current_data)
+        if has_departure_data:
+            save_current_data(current_data_departure)
+        if has_arrival_data:
+            try:
+                cleaned_data = []
+                for item in current_data_arrival:
+                    cleaned_item = {}
+                    for key, value in item.items():
+                        if isinstance(value, float):
+                            import math
+                            if math.isnan(value):
+                                cleaned_item[key] = None
+                            else:
+                                cleaned_item[key] = value
+                        else:
+                            cleaned_item[key] = value
+                    cleaned_data.append(cleaned_item)
+                
+                with open(CACHE_FILE_ARRIVAL, 'w', encoding='utf-8') as f:
+                    json.dump(cleaned_data, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                print(f"警告: 到着便キャッシュファイルの保存に失敗 - {e}")
+        
         print("\n" + "=" * 60)
         print("✓ チェック完了（変更なし）")
         print("=" * 60)

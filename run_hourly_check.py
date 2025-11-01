@@ -4,13 +4,15 @@
 # @brief          時間ごとチェック実行ラッパー（Windows Task Scheduler用）
 # @author         GitHub Copilot
 # @date           2025/11/01
-# $Version:       1.00
-# $Revision:      2025/11/01 - 初期実装
+# $Version:       1.01
+# $Revision:      2025/11/01 - 到着便対応追加
 # @note           hourly_check.pyをUTF-8エンコーディングで実行
 #                 Windows環境でのコンソール出力文字化け対策
-# @attention      Windows Task Schedulerから実行される想定
+#                 出発便と到着便の両方の変更を検出してDiscord通知
+# @attention      Windows Task Schedulerから1時間ごとに実行される想定
 # @par            History
 #                 v1.00 (2025/11/01) - 初期実装
+#                 v1.01 (2025/11/01) - 到着便データ取得・変更検出機能追加
 # Copyright (c) 2025. All Rights reserved.
 #
 # -----------------------------------------------------------------------------------#

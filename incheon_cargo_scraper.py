@@ -1,17 +1,19 @@
 # coding: utf_8
 # -----------------------------------------------------------------------------------#
 # @file           incheon_cargo_scraper.py
-# @brief          仁川国際空港 貨物出発スケジュール スクレイピングシステム
+# @brief          仁川国際空港 貨物出発・到着スケジュール スクレイピングシステム
 # @author         GitHub Copilot
 # @date           2025/11/01
-# $Version:       1.00
-# $Revision:      2025/11/01 - 初期実装
-# @note           仁川国際空港の貨物出発スケジュールをWebスクレイピング
+# $Version:       1.01
+# $Revision:      2025/11/01 - 到着便対応追加
+# @note           仁川国際空港の貨物出発・到着スケジュールをWebスクレイピング
 #                 Discord Webhook通知機能を含む
-# @attention      APIエンドポイント: https://www.airport.kr/depCargo/ap_ja/depCargoSchList.do
+# @attention      出発便APIエンドポイント: https://www.airport.kr/depCargo/ap_ja/depCargoSchList.do
+#                 到着便APIエンドポイント: https://www.airport.kr/arrCargo/ap_ja/arrCargoSchList.do
 #                 データ構造: div.data > div.body > div.group > div.row
 # @par            History
 #                 v1.00 (2025/11/01) - 初期実装・Discord通知機能追加
+#                 v1.01 (2025/11/01) - 到着便データ取得機能追加・CSV出力デフォルト無効化
 # Copyright (c) 2025. All Rights reserved.
 #
 # -----------------------------------------------------------------------------------#
@@ -39,7 +41,7 @@ class IncheonCargoScraper:
     クラス概要： 仁川国際空港の貨物スケジュールをスクレイピングするクラス
     
     主な機能:
-    - 貨物出発スケジュールの取得
+    - 貨物出発・到着スケジュールの取得
     - 複数日のデータ取得
     - CSV/JSON/Excel形式でのエクスポート
     - Discord Webhook通知
@@ -51,17 +53,26 @@ class IncheonCargoScraper:
     def __init__(self, discord_webhook_url=None):
         """
         ---------------------------------------------------------------------
-        メソッド概要： コンストラクタ
+        メソッド概要：  コンストラクタ
         - APIエンドポイントとヘッダーを設定
         - Discord Webhook URLを初期化
         ----------------------------------------------------------------------
         Args:
             discord_webhook_url (str, optional): Discord Webhook URL
         ---------------------------------------------------------------------
+        Returns:
+            なし
+        ---------------------------------------------------------------------
+        Notes:
+            - author         GitHub Copilot
+            - revision       v1.01 (2025/11/01) - 到着便対応追加
+        ---------------------------------------------------------------------
         """
         # 実際のAPIエンドポイント（encパラメータをデコードして取得）
-        self.api_url = "https://www.airport.kr/depCargo/ap_ja/depCargoSchList.do"
-        self.base_url = "https://www.airport.kr/ap_ja/1787/subview.do"
+        self.dep_api_url = "https://www.airport.kr/depCargo/ap_ja/depCargoSchList.do"
+        self.arr_api_url = "https://www.airport.kr/arrCargo/ap_ja/arrCargoSchList.do"
+        self.dep_base_url = "https://www.airport.kr/ap_ja/1787/subview.do"
+        self.arr_base_url = "https://www.airport.kr/ap_ja/1790/subview.do"
         self.discord_webhook_url = discord_webhook_url or os.getenv('DISCORD_WEBHOOK_URL')
         self.headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -76,10 +87,10 @@ class IncheonCargoScraper:
     
     # ======================================================================================#
     # @method name:   build_params
-    def build_params(self, date_str=None, airport='NGO', start_time='0000', end_time='2359'):
+    def build_params(self, date_str=None, airport='NGO', start_time='0000', end_time='2359', flight_type='departure'):
         """
         ---------------------------------------------------------------------
-        メソッド概要： APIリクエストのパラメータを構築
+        メソッド概要：  APIリクエストのパラメータを構築
         - 日付、空港、時刻範囲を指定してパラメータ辞書を生成
         ----------------------------------------------------------------------
         Args:
@@ -87,9 +98,14 @@ class IncheonCargoScraper:
             airport (str): 空港コード (デフォルト: NGO - 名古屋)
             start_time (str): 開始時刻 (HHMM形式)
             end_time (str): 終了時刻 (HHMM形式)
+            flight_type (str): フライトタイプ ('departure' or 'arrival')
         ---------------------------------------------------------------------
         Returns:
             dict: APIリクエストパラメータ
+        ---------------------------------------------------------------------
+        Notes:
+            - author         GitHub Copilot
+            - revision       v1.01 (2025/11/01) - 到着便対応追加
         ---------------------------------------------------------------------
         """
         if date_str is None:
@@ -125,23 +141,32 @@ class IncheonCargoScraper:
     
     # ======================================================================================#
     # @method name:   fetch_page
-    def fetch_page(self, params):
+    def fetch_page(self, params, flight_type='departure'):
         """
         ---------------------------------------------------------------------
-        メソッド概要： ページを取得する（APIエンドポイント使用）
+        メソッド概要：  ページを取得する（APIエンドポイント使用）
         - APIエンドポイントにリクエストを送信
         - レスポンスをBeautifulSoupでパース
         ----------------------------------------------------------------------
         Args:
             params (dict): リクエストパラメータ
+            flight_type (str): フライトタイプ ('departure' or 'arrival')
         ---------------------------------------------------------------------
         Returns:
             BeautifulSoup: パースされたHTML
         ---------------------------------------------------------------------
+        Notes:
+            - author         GitHub Copilot
+            - revision       v1.01 (2025/11/01) - 到着便対応追加
+        ---------------------------------------------------------------------
         """
         try:
+            # フライトタイプに応じてURLを選択
+            api_url = self.dep_api_url if flight_type == 'departure' else self.arr_api_url
+            base_url = self.dep_base_url if flight_type == 'departure' else self.arr_base_url
+            
             # まずAPIエンドポイントを試す
-            response = self.session.get(self.api_url, params=params, headers=self.headers, timeout=30)
+            response = self.session.get(api_url, params=params, headers=self.headers, timeout=30)
             response.raise_for_status()
             response.encoding = 'utf-8'
             
@@ -153,7 +178,7 @@ class IncheonCargoScraper:
                 
                 # iframeやサブビューのURLを試す
                 alt_params = params.copy()
-                response = self.session.get(self.base_url, params=alt_params, headers=self.headers, timeout=30)
+                response = self.session.get(base_url, params=alt_params, headers=self.headers, timeout=30)
                 response.raise_for_status()
                 response.encoding = 'utf-8'
                 soup = BeautifulSoup(response.text, 'html.parser')
@@ -166,23 +191,34 @@ class IncheonCargoScraper:
     
     # ======================================================================================#
     # @method name:   parse_cargo_table
-    def parse_cargo_table(self, soup):
+    def parse_cargo_table(self, soup, flight_type='departure'):
         """
         ---------------------------------------------------------------------
-        メソッド概要： 貨物スケジュールテーブルをパース
+        メソッド概要：  貨物スケジュールテーブルをパース
         - HTMLからdiv.data構造を解析
         - フライト情報を抽出してリスト化
         ----------------------------------------------------------------------
         Args:
             soup (BeautifulSoup): パースされたHTML
+            flight_type (str): フライトタイプ ('departure' or 'arrival')
         ---------------------------------------------------------------------
         Returns:
             list: 貨物情報のリスト（辞書形式）
+        ---------------------------------------------------------------------
+        Notes:
+            - author         GitHub Copilot
+            - revision       v1.01 (2025/11/01) - 到着便対応追加
         ---------------------------------------------------------------------
         """
         cargo_data = []
         
         print("  HTML解析中...")
+        
+        # 出発便か到着便かでキー名を設定
+        time_key_scheduled = '出発時間（予定）' if flight_type == 'departure' else '到着時間（予定）'
+        time_key_actual = '出発時間（実際）' if flight_type == 'departure' else '到着時間（実際）'
+        location_key = '目的地' if flight_type == 'departure' else '出発地'
+        status_key = '出発状態' if flight_type == 'departure' else '到着状態'
         
         # 新しい構造: div.data の中の div.row を探す
         data_container = soup.find('div', class_='data')
@@ -211,21 +247,21 @@ class IncheonCargoScraper:
                     if toggle_row:
                         row_data = {}
                         
-                        # 出発時間
+                        # 時間（出発または到着）
                         col1 = toggle_row.find('div', class_='col1')
                         if col1:
                             time_elem = col1.find('strong')
                             if time_elem:
                                 scheduled_time = time_elem.get_text(strip=True)
-                                row_data['出発時間（予定）'] = scheduled_time
+                                row_data[time_key_scheduled] = scheduled_time
                             
                             # 実際の時間（spanがあれば）
                             time_span = col1.find('span')
                             if time_span:
                                 actual_time = time_span.get_text(strip=True)
-                                row_data['出発時間（実際）'] = actual_time
+                                row_data[time_key_actual] = actual_time
                         
-                        # 目的地
+                        # 目的地または出発地
                         col2 = toggle_row.find('div', class_='col2')
                         if col2:
                             location_div = col2.find('div', class_='location')
@@ -236,7 +272,7 @@ class IncheonCargoScraper:
                                 
                                 # 経由地情報を含むテキストを取得
                                 location_text = location_div.get_text(strip=True)
-                                row_data['目的地'] = location_text
+                                row_data[location_key] = location_text
                         
                         # 航空会社/便名
                         col3 = toggle_row.find('div', class_='col3')
@@ -283,7 +319,7 @@ class IncheonCargoScraper:
                             if gate:
                                 row_data['駐機場'] = gate
                         
-                        # 出発状態
+                        # 状態（出発または到着）
                         col6 = toggle_row.find('div', class_='col6')
                         if col6:
                             # hidden-textを除外
@@ -291,11 +327,11 @@ class IncheonCargoScraper:
                                 hidden.decompose()
                             status = col6.get_text(strip=True)
                             if status:
-                                row_data['出発状態'] = status
+                                row_data[status_key] = status
                         
                         if row_data:
                             cargo_data.append(row_data)
-                            print(f"  ✓ フライトデータ追加: {row_data.get('便名', 'N/A')} - {row_data.get('目的地', 'N/A')}")
+                            print(f"  ✓ フライトデータ追加: {row_data.get('便名', 'N/A')} - {row_data.get(location_key, 'N/A')}")
         
         # 古い構造（テーブル）もチェック
         if not cargo_data:
@@ -361,10 +397,10 @@ class IncheonCargoScraper:
     
     # ======================================================================================#
     # @method name:   scrape
-    def scrape(self, date_str=None, airport='NGO', output_format=None, save_html=False):
+    def scrape(self, date_str=None, airport='NGO', output_format=None, save_html=False, flight_type='departure'):
         """
         ---------------------------------------------------------------------
-        メソッド概要： 貨物スケジュールをスクレイピング
+        メソッド概要：  貨物スケジュールをスクレイピング
         - 指定日付・空港のデータを取得
         - オプションでファイル保存
         ----------------------------------------------------------------------
@@ -373,30 +409,38 @@ class IncheonCargoScraper:
             airport (str): 空港コード (デフォルト: NGO)
             output_format (str): 出力形式 ('csv', 'json', 'excel')
             save_html (bool): HTMLを保存するかどうか
+            flight_type (str): フライトタイプ ('departure' or 'arrival')
         ---------------------------------------------------------------------
         Returns:
             pd.DataFrame: スクレイピングされたデータ
         ---------------------------------------------------------------------
+        Notes:
+            - author         GitHub Copilot
+            - revision       v1.01 (2025/11/01) - 到着便対応追加
+        ---------------------------------------------------------------------
         """
-        params = self.build_params(date_str, airport)
-        print(f"取得パラメータ: 日付={params['curDate']}, 空港={airport}")
-        print(f"APIエンドポイント: {self.api_url}")
+        params = self.build_params(date_str, airport, flight_type=flight_type)
+        flight_type_ja = '出発' if flight_type == 'departure' else '到着'
+        api_url = self.dep_api_url if flight_type == 'departure' else self.arr_api_url
+        
+        print(f"取得パラメータ: 日付={params['curDate']}, 空港={airport}, タイプ={flight_type_ja}")
+        print(f"APIエンドポイント: {api_url}")
         print(f"データを取得中...")
         
-        soup = self.fetch_page(params)
+        soup = self.fetch_page(params, flight_type)
         if not soup:
             return None
         
         # デバッグ用: HTMLを保存
         if save_html:
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            html_filename = f'debug_html_{timestamp}.html'
+            html_filename = f'debug_html_{flight_type}_{timestamp}.html'
             with open(html_filename, 'w', encoding='utf-8') as f:
                 f.write(soup.prettify())
             print(f"  デバッグ用HTMLを保存: {html_filename}")
         
         # データをパース
-        cargo_data = self.parse_cargo_table(soup)
+        cargo_data = self.parse_cargo_table(soup, flight_type)
         
         if not cargo_data:
             print("警告: データが見つかりませんでした")
@@ -419,7 +463,7 @@ class IncheonCargoScraper:
     def save_data(self, df, date_str, airport, output_format):
         """
         ---------------------------------------------------------------------
-        メソッド概要： データを保存する
+        メソッド概要：  データを保存する
         - CSV/JSON/Excel形式でエクスポート
         - logディレクトリに保存
         ----------------------------------------------------------------------
@@ -431,6 +475,10 @@ class IncheonCargoScraper:
         ---------------------------------------------------------------------
         Returns:
             なし
+        ---------------------------------------------------------------------
+        Notes:
+            - author         GitHub Copilot
+            - revision       v1.00 (2025/11/01) - 初期実装
         ---------------------------------------------------------------------
         """
         # logディレクトリを作成
@@ -458,10 +506,10 @@ class IncheonCargoScraper:
     
     # ======================================================================================#
     # @method name:   scrape_multiple_dates
-    def scrape_multiple_dates(self, start_date, end_date, airport='NGO', output_format=None):
+    def scrape_multiple_dates(self, start_date, end_date, airport='NGO', output_format=None, flight_type='departure'):
         """
         ---------------------------------------------------------------------
-        メソッド概要: 複数日のデータをスクレイピング
+        メソッド概要：  複数日のデータをスクレイピング
         - 指定期間のデータを日ごとに取得
         - 結果を結合して返す
         ----------------------------------------------------------------------
@@ -470,9 +518,14 @@ class IncheonCargoScraper:
             end_date (str): 終了日 (YYYYMMDD形式)
             airport (str): 空港コード (デフォルト: NGO)
             output_format (str): 出力形式 ('csv', 'json', 'excel')
+            flight_type (str): フライトタイプ ('departure' or 'arrival')
         ---------------------------------------------------------------------
         Returns:
             pd.DataFrame: 結合されたデータ
+        ---------------------------------------------------------------------
+        Notes:
+            - author         GitHub Copilot
+            - revision       v1.01 (2025/11/01) - 到着便対応追加
         ---------------------------------------------------------------------
         """
         all_data = []
@@ -485,7 +538,7 @@ class IncheonCargoScraper:
             date_str = current.strftime('%Y%m%d')
             print(f"\n--- {date_str} のデータを取得中 ---")
             
-            df = self.scrape(date_str, airport, output_format=None, save_html=False)
+            df = self.scrape(date_str, airport, output_format=None, save_html=False, flight_type=flight_type)
             if df is not None and len(df) > 0:
                 df['取得日'] = date_str
                 all_data.append(df)
@@ -507,10 +560,10 @@ class IncheonCargoScraper:
     
     # ======================================================================================#
     # @method name:   send_discord_notification
-    def send_discord_notification(self, df, start_date, end_date, airport='NGO'):
+    def send_discord_notification(self, df, start_date, end_date, airport='NGO', flight_type='departure'):
         """
         ---------------------------------------------------------------------
-        メソッド概要: Discordに通知を送信
+        メソッド概要：  Discordに通知を送信
         - Webhook経由でフライト情報を送信
         - リッチエンベッド形式で見やすく表示
         ----------------------------------------------------------------------
@@ -519,9 +572,14 @@ class IncheonCargoScraper:
             start_date (str): 開始日
             end_date (str): 終了日
             airport (str): 空港コード (デフォルト: NGO)
+            flight_type (str): フライトタイプ ('departure' or 'arrival')
         ---------------------------------------------------------------------
         Returns:
             bool: 送信成功時True
+        ---------------------------------------------------------------------
+        Notes:
+            - author         GitHub Copilot
+            - revision       v1.01 (2025/11/01) - 到着便対応追加
         ---------------------------------------------------------------------
         """
         if not self.discord_webhook_url:
@@ -534,8 +592,24 @@ class IncheonCargoScraper:
             return False
         
         try:
+            # フライトタイプに応じてタイトルと絵文字を設定
+            if flight_type == 'departure':
+                emoji = "🛫"
+                type_ja = "出発"
+                time_key_scheduled = '出発時間（予定）'
+                time_key_actual = '出発時間（実際）'
+                location_key = '目的地'
+                status_key = '出発状態'
+            else:
+                emoji = "🛬"
+                type_ja = "到着"
+                time_key_scheduled = '到着時間（予定）'
+                time_key_actual = '到着時間（実際）'
+                location_key = '出発地'
+                status_key = '到着状態'
+            
             # メッセージを構築
-            title = f"🛫 仁川国際空港 貨物出発スケジュール"
+            title = f"{emoji} 仁川国際空港 貨物{type_ja}スケジュール"
             description = f"**期間**: {start_date} ~ {end_date}\n**空港**: {airport}\n**取得件数**: {len(df)}件\n\n"
             
             # データをグループ化して整形
@@ -551,22 +625,24 @@ class IncheonCargoScraper:
                         airline = row.get('航空会社', 'N/A')
                         flight_info = f"✈️ **{flight_num}** ({airline})\n"
                         
-                        # 目的地
-                        destination = row.get('目的地', 'N/A')
-                        if isinstance(destination, str):
-                            flight_info += f"  📍 目的地: {destination}\n"
+                        # 目的地または出発地
+                        location = row.get(location_key, 'N/A')
+                        if isinstance(location, str):
+                            location_label = "目的地" if flight_type == 'departure' else "出発地"
+                            flight_info += f"  📍 {location_label}: {location}\n"
                         
-                        # 出発時間情報
-                        scheduled = row.get('出発時間（予定）', 'N/A')
-                        actual = row.get('出発時間（実際）', '')
+                        # 時間情報
+                        scheduled = row.get(time_key_scheduled, 'N/A')
+                        actual = row.get(time_key_actual, '')
                         
+                        time_label = f"{type_ja}時間"
                         if actual and isinstance(actual, str) and actual != scheduled:
                             # 予定と実際が異なる場合
-                            flight_info += f"  🕐 予定出発時間: {scheduled}\n"
-                            flight_info += f"  🕐 実出発時間: **{actual}**\n"
+                            flight_info += f"  🕐 予定{time_label}: {scheduled}\n"
+                            flight_info += f"  🕐 実{time_label}: **{actual}**\n"
                         else:
                             # 予定のみの場合
-                            flight_info += f"  🕐 予定出発時間: {scheduled}\n"
+                            flight_info += f"  🕐 予定{time_label}: {scheduled}\n"
                         
                         # 駐機場
                         gate = row.get('駐機場', 'N/A')
@@ -578,10 +654,10 @@ class IncheonCargoScraper:
                         if terminal and terminal != 'N/A' and isinstance(terminal, str):
                             flight_info += f"  🏢 ターミナル: {terminal}\n"
                         
-                        # 出発状態
-                        status = row.get('出発状態', '')
+                        # 状態
+                        status = row.get(status_key, '')
                         if status and isinstance(status, str):
-                            status_icon = "✅" if "出発" in status else "⏳"
+                            status_icon = "✅" if type_ja in status else "⏳"
                             flight_info += f"  {status_icon} 状態: {status}\n"
                         
                         description += flight_info + "\n"
@@ -682,7 +758,7 @@ class IncheonCargoScraper:
 def main():
     """
     ---------------------------------------------------------------------
-    関数概要: メイン関数
+    関数概要：  メイン関数
     - スクレイピングのテスト・使用例を実行
     - 動作確認用
     ----------------------------------------------------------------------
@@ -691,6 +767,10 @@ def main():
     ---------------------------------------------------------------------
     Returns:
         なし
+    ---------------------------------------------------------------------
+    Notes:
+        - author         GitHub Copilot
+        - revision       v1.01 (2025/11/01) - 到着便対応追加
     ---------------------------------------------------------------------
     """
     print("=" * 60)
