@@ -610,7 +610,14 @@ class IncheonCargoScraper:
             
             # メッセージを構築
             title = f"{emoji} 仁川国際空港 貨物{type_ja}スケジュール"
-            description = f"**期間**: {start_date} ~ {end_date}\n**空港**: {airport}\n**取得件数**: {len(df)}件\n\n"
+            
+            # 変更種別があるかチェック（hourly_checkから呼ばれた場合）
+            has_change_type = '変更種別' in df.columns if hasattr(df, 'columns') else False
+            
+            if has_change_type:
+                description = f"**期間**: {start_date} ~ {end_date}\n**空港**: {airport}\n**変更件数**: {len(df)}件\n\n"
+            else:
+                description = f"**期間**: {start_date} ~ {end_date}\n**空港**: {airport}\n**取得件数**: {len(df)}件\n\n"
             
             # データをグループ化して整形
             if '取得日' in df.columns:
@@ -620,10 +627,25 @@ class IncheonCargoScraper:
                     description += f"**📅 {date_formatted}**\n"
                     
                     for idx, row in group.iterrows():
+                        # 変更種別の表示
+                        change_type = row.get('変更種別', '')
+                        if change_type:
+                            if change_type == '新規':
+                                change_icon = "🆕"
+                            elif change_type == '削除':
+                                change_icon = "🗑️"
+                            elif change_type == '時間変更':
+                                change_icon = "⏰"
+                            else:
+                                change_icon = "📝"
+                            change_prefix = f"{change_icon} **[{change_type}]** "
+                        else:
+                            change_prefix = ""
+                        
                         # 便名と航空会社
                         flight_num = row.get('便名', 'N/A')
                         airline = row.get('航空会社', 'N/A')
-                        flight_info = f"✈️ **{flight_num}** ({airline})\n"
+                        flight_info = f"{change_prefix}✈️ **{flight_num}** ({airline})\n"
                         
                         # 目的地または出発地
                         location = row.get(location_key, 'N/A')
@@ -636,7 +658,16 @@ class IncheonCargoScraper:
                         actual = row.get(time_key_actual, '')
                         
                         time_label = f"{type_ja}時間"
-                        if actual and isinstance(actual, str) and actual != scheduled:
+                        
+                        # 時間変更の場合は前回の時間も表示
+                        if change_type == '時間変更':
+                            prev_time = row.get('前回時間', '')
+                            flight_info += f"  🕐 予定{time_label}: {scheduled}\n"
+                            if prev_time:
+                                flight_info += f"  ⏰ 前回: {prev_time} → **{actual}**\n"
+                            else:
+                                flight_info += f"  🕐 実{time_label}: **{actual}**\n"
+                        elif actual and isinstance(actual, str) and actual != scheduled:
                             # 予定と実際が異なる場合
                             flight_info += f"  🕐 予定{time_label}: {scheduled}\n"
                             flight_info += f"  🕐 実{time_label}: **{actual}**\n"

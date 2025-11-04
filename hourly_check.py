@@ -166,40 +166,47 @@ def compare_data(previous, current):
         current (list): 現在取得したデータ
     ---------------------------------------------------------------------
     Returns:
-        tuple: (変更有無(bool), 変更内容の説明(str))
+        tuple: (変更有無(bool), 変更内容の説明(str), 変更データリスト(list))
     ---------------------------------------------------------------------
     Notes:
         - author         GitHub Copilot
-        - revision       v1.00 (2025/11/01) - 初期実装
+        - revision       v1.02 (2025/11/04) - 変更データのリストを返すように修正
     ---------------------------------------------------------------------
     """
     if previous is None:
-        return True, "初回実行のため全データを通知"
+        return True, "初回実行のため全データを通知", current
     
     changes = []
+    changed_items = []  # 変更があったアイテムを格納
     
     # 前回のデータをセットに変換（NaNを正規化）
     prev_flights = set()
+    prev_dict = {}  # 便名と日付をキーにした辞書
     for item in previous:
         # 便名、日付、出発時間をキーにする
         key = (
             normalize_value(item.get('便名')),
             normalize_value(item.get('取得日')),
-            normalize_value(item.get('出発時間（予定）')),
-            normalize_value(item.get('出発時間（実際）'))
+            normalize_value(item.get('出発時間（予定）')) or normalize_value(item.get('到着時間（予定）')),
+            normalize_value(item.get('出発時間（実際）')) or normalize_value(item.get('到着時間（実際）'))
         )
         prev_flights.add(key)
+        flight_key = (normalize_value(item.get('便名')), normalize_value(item.get('取得日')))
+        prev_dict[flight_key] = item
     
     # 現在のデータをセットに変換（NaNを正規化）
     curr_flights = set()
+    curr_dict = {}
     for item in current:
         key = (
             normalize_value(item.get('便名')),
             normalize_value(item.get('取得日')),
-            normalize_value(item.get('出発時間（予定）')),
-            normalize_value(item.get('出発時間（実際）'))
+            normalize_value(item.get('出発時間（予定）')) or normalize_value(item.get('到着時間（予定）')),
+            normalize_value(item.get('出発時間（実際）')) or normalize_value(item.get('到着時間（実際）'))
         )
         curr_flights.add(key)
+        flight_key = (normalize_value(item.get('便名')), normalize_value(item.get('取得日')))
+        curr_dict[flight_key] = item
     
     # 新規追加されたフライト
     added = curr_flights - prev_flights
@@ -207,6 +214,12 @@ def compare_data(previous, current):
         changes.append(f"新規: {len(added)}件")
         for flight in added:
             print(f"  + 新規: {flight[0]} ({flight[1]}) - {flight[2]}")
+            # 対応するデータを探して追加
+            flight_key = (flight[0], flight[1])
+            if flight_key in curr_dict:
+                item = curr_dict[flight_key].copy()
+                item['変更種別'] = '新規'
+                changed_items.append(item)
     
     # 削除されたフライト
     removed = prev_flights - curr_flights
@@ -214,38 +227,49 @@ def compare_data(previous, current):
         changes.append(f"削除: {len(removed)}件")
         for flight in removed:
             print(f"  - 削除: {flight[0]} ({flight[1]}) - {flight[2]}")
+            # 対応するデータを探して追加
+            flight_key = (flight[0], flight[1])
+            if flight_key in prev_dict:
+                item = prev_dict[flight_key].copy()
+                item['変更種別'] = '削除'
+                changed_items.append(item)
     
     # 出発時間の変更をチェック
     for curr_item in current:
         curr_key = (
             normalize_value(curr_item.get('便名')),
             normalize_value(curr_item.get('取得日')),
-            normalize_value(curr_item.get('出発時間（予定）'))
+            normalize_value(curr_item.get('出発時間（予定）')) or normalize_value(curr_item.get('到着時間（予定）'))
         )
         
         for prev_item in previous:
             prev_key = (
                 normalize_value(prev_item.get('便名')),
                 normalize_value(prev_item.get('取得日')),
-                normalize_value(prev_item.get('出発時間（予定）'))
+                normalize_value(prev_item.get('出発時間（予定）')) or normalize_value(prev_item.get('到着時間（予定）'))
             )
             
             if curr_key == prev_key:
                 # 同じフライトの出発時間（実際）を比較
-                prev_actual = normalize_value(prev_item.get('出発時間（実際）'))
-                curr_actual = normalize_value(curr_item.get('出発時間（実際）'))
+                prev_actual = normalize_value(prev_item.get('出発時間（実際）')) or normalize_value(prev_item.get('到着時間（実際）'))
+                curr_actual = normalize_value(curr_item.get('出発時間（実際）')) or normalize_value(curr_item.get('到着時間（実際）'))
                 
                 if prev_actual != curr_actual:
                     changes.append(f"時間変更: {curr_key[0]}")
                     prev_str = prev_actual if prev_actual is not None else "未定"
                     curr_str = curr_actual if curr_actual is not None else "未定"
                     print(f"  ⚠ 時間変更: {curr_key[0]} ({curr_key[1]}) {prev_str} → {curr_str}")
+                    # 変更後のデータを追加
+                    item = curr_item.copy()
+                    item['変更種別'] = '時間変更'
+                    item['前回時間'] = prev_str
+                    changed_items.append(item)
 
     
     if changes:
-        return True, ", ".join(changes)
+        return True, ", ".join(changes), changed_items
     else:
-        return False, "変更なし"
+        return False, "変更なし", []
 # @function end
 # ======================================================================================#
 
@@ -335,15 +359,19 @@ def main():
     has_changes_overall = False
     
     # 出発便の変更チェック
+    has_changes_dep = False
+    changed_data_departure = []
     if has_departure_data:
         current_data_departure = df_departure.to_dict('records')
         print("\n【出発便】前回データとの比較中...")
         previous_data_departure = load_previous_data()
-        has_changes_dep, change_summary_dep = compare_data(previous_data_departure, current_data_departure)
+        has_changes_dep, change_summary_dep, changed_data_departure = compare_data(previous_data_departure, current_data_departure)
         print(f"出発便比較結果: {change_summary_dep}")
         has_changes_overall = has_changes_overall or has_changes_dep
     
     # 到着便の変更チェック
+    has_changes_arr = False
+    changed_data_arrival = []
     if has_arrival_data:
         current_data_arrival = df_arrival.to_dict('records')
         print("\n【到着便】前回データとの比較中...")
@@ -358,7 +386,7 @@ def main():
         else:
             previous_data_arrival = None
         
-        has_changes_arr, change_summary_arr = compare_data(previous_data_arrival, current_data_arrival)
+        has_changes_arr, change_summary_arr, changed_data_arrival = compare_data(previous_data_arrival, current_data_arrival)
         print(f"到着便比較結果: {change_summary_arr}")
         has_changes_overall = has_changes_overall or has_changes_arr
     
@@ -368,18 +396,24 @@ def main():
         success_departure = False
         success_arrival = False
         
-        # 出発便の通知
-        if has_departure_data and has_changes_dep:
-            print("\n【出発便の通知送信】")
+        # 出発便の通知（変更データのみ）
+        if has_departure_data and has_changes_dep and changed_data_departure:
+            print(f"\n【出発便の通知送信】変更データ: {len(changed_data_departure)}件")
+            # 変更データのみをDataFrameに変換
+            import pandas as pd
+            df_departure_changed = pd.DataFrame(changed_data_departure)
             success_departure = scraper.send_discord_notification(
-                df_departure, start_date, end_date, 'NGO', flight_type='departure'
+                df_departure_changed, start_date, end_date, 'NGO', flight_type='departure'
             )
         
-        # 到着便の通知
-        if has_arrival_data and has_changes_arr:
-            print("\n【到着便の通知送信】")
+        # 到着便の通知（変更データのみ）
+        if has_arrival_data and has_changes_arr and changed_data_arrival:
+            print(f"\n【到着便の通知送信】変更データ: {len(changed_data_arrival)}件")
+            # 変更データのみをDataFrameに変換
+            import pandas as pd
+            df_arrival_changed = pd.DataFrame(changed_data_arrival)
             success_arrival = scraper.send_discord_notification(
-                df_arrival, start_date, end_date, 'NGO', flight_type='arrival'
+                df_arrival_changed, start_date, end_date, 'NGO', flight_type='arrival'
             )
         
         success = success_departure or success_arrival
