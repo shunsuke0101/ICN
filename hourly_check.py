@@ -4,16 +4,26 @@
 # @brief          仁川国際空港 貨物スケジュール 時間ごと変更検知システム
 # @author         GitHub Copilot
 # @date           2025/11/01
-# $Version:       1.01
-# $Revision:      2025/11/01 - 到着便対応追加
+# $Version:       1.03
+# $Revision:      2025/11/04 - 通知フィルタリング機能追加
 # @note           1時間ごとに実行し、前回データとの差分を検出してDiscord通知
 #                 出発便・到着便それぞれ独立して変更を検出
 #                 変更がない場合は通知をスキップすることで無駄な通知を削減
+#                 
+#                 【通知対象】
+#                 - 🆕 新規: 完全に新しい便名のみ（同じ便名の別日追加は除外）
+#                 - ⏰ 時間変更: 出発/到着時間の変更
+#                 
+#                 【通知対象外】
+#                 - 🗑️ 削除: 便名の削除は通知しない（ノイズ削減）
+#                 - 同じ便名の別日追加（スケジュール更新による自然な追加）
 # @attention      Windows Task Schedulerで1時間ごとに実行される想定
 #                 last_data_cache.jsonとlast_data_cache_arrival.jsonに前回データを保存
 # @par            History
 #                 v1.00 (2025/11/01) - 初期実装・NaN値正規化対応
 #                 v1.01 (2025/11/01) - 到着便データ取得・変更検出機能追加
+#                 v1.02 (2025/11/04) - 変更データのみ通知機能追加
+#                 v1.03 (2025/11/04) - 通知フィルタリング（新規・時間変更のみ）
 # Copyright (c) 2025. All Rights reserved.
 #
 # -----------------------------------------------------------------------------------#
@@ -159,7 +169,9 @@ def compare_data(previous, current):
     ---------------------------------------------------------------------
     関数概要：  データを比較して変更を検出
     - 前回データと現在データを比較
-    - 新規追加、削除、時間変更を検出
+    - 完全に新しい便名のみを新規として検出
+    - 同じ便名の時間変更を検出
+    - 削除は通知対象外（ノイズ削減）
     ----------------------------------------------------------------------
     Args:
         previous (list): 前回取得したデータ
@@ -170,7 +182,7 @@ def compare_data(previous, current):
     ---------------------------------------------------------------------
     Notes:
         - author         GitHub Copilot
-        - revision       v1.02 (2025/11/04) - 変更データのリストを返すように修正
+        - revision       v1.03 (2025/11/04) - 通知フィルタリング機能追加
     ---------------------------------------------------------------------
     """
     if previous is None:
@@ -208,62 +220,85 @@ def compare_data(previous, current):
         flight_key = (normalize_value(item.get('便名')), normalize_value(item.get('取得日')))
         curr_dict[flight_key] = item
     
-    # 新規追加されたフライト
+    # 新規追加されたフライト（完全に新しい便名のみ）
     added = curr_flights - prev_flights
+    new_flight_names = set()  # 完全に新しい便名を記録
+    
     if added:
-        changes.append(f"新規: {len(added)}件")
+        # まず、完全に新しい便名かどうかを判定
         for flight in added:
-            print(f"  + 新規: {flight[0]} ({flight[1]}) - {flight[2]}")
-            # 対応するデータを探して追加
-            flight_key = (flight[0], flight[1])
-            if flight_key in curr_dict:
-                item = curr_dict[flight_key].copy()
-                item['変更種別'] = '新規'
-                changed_items.append(item)
+            flight_name = flight[0]
+            flight_date = flight[1]
+            
+            # この便名が前回データに存在したかチェック
+            is_completely_new = True
+            for prev_item in previous:
+                if normalize_value(prev_item.get('便名')) == flight_name:
+                    # 同じ便名が前回データに存在する = 時間変更として扱う
+                    is_completely_new = False
+                    break
+            
+            if is_completely_new:
+                # 完全に新しい便名
+                print(f"  + 新規: {flight_name} ({flight_date}) - {flight[2]}")
+                new_flight_names.add(flight_name)
+                flight_key = (flight_name, flight_date)
+                if flight_key in curr_dict:
+                    item = curr_dict[flight_key].copy()
+                    item['変更種別'] = '新規'
+                    changed_items.append(item)
+        
+        if new_flight_names:
+            changes.append(f"新規: {len(new_flight_names)}件")
     
-    # 削除されたフライト
-    removed = prev_flights - curr_flights
-    if removed:
-        changes.append(f"削除: {len(removed)}件")
-        for flight in removed:
-            print(f"  - 削除: {flight[0]} ({flight[1]}) - {flight[2]}")
-            # 対応するデータを探して追加
-            flight_key = (flight[0], flight[1])
-            if flight_key in prev_dict:
-                item = prev_dict[flight_key].copy()
-                item['変更種別'] = '削除'
-                changed_items.append(item)
+    # 削除されたフライトは通知しない（コメントアウト）
+    # removed = prev_flights - curr_flights
+    # if removed:
+    #     changes.append(f"削除: {len(removed)}件")
+    #     for flight in removed:
+    #         print(f"  - 削除: {flight[0]} ({flight[1]}) - {flight[2]}")
+    #         # 対応するデータを探して追加
+    #         flight_key = (flight[0], flight[1])
+    #         if flight_key in prev_dict:
+    #             item = prev_dict[flight_key].copy()
+    #             item['変更種別'] = '削除'
+    #             changed_items.append(item)
     
-    # 出発時間の変更をチェック
+    # 出発時間/到着時間の変更をチェック
+    time_changes = set()  # 時間変更があった便名を記録（重複排除）
+    
     for curr_item in current:
-        curr_key = (
-            normalize_value(curr_item.get('便名')),
-            normalize_value(curr_item.get('取得日')),
-            normalize_value(curr_item.get('出発時間（予定）')) or normalize_value(curr_item.get('到着時間（予定）'))
-        )
+        curr_flight_name = normalize_value(curr_item.get('便名'))
+        curr_date = normalize_value(curr_item.get('取得日'))
+        curr_scheduled = normalize_value(curr_item.get('出発時間（予定）')) or normalize_value(curr_item.get('到着時間（予定）'))
         
         for prev_item in previous:
-            prev_key = (
-                normalize_value(prev_item.get('便名')),
-                normalize_value(prev_item.get('取得日')),
-                normalize_value(prev_item.get('出発時間（予定）')) or normalize_value(prev_item.get('到着時間（予定）'))
-            )
+            prev_flight_name = normalize_value(prev_item.get('便名'))
+            prev_date = normalize_value(prev_item.get('取得日'))
+            prev_scheduled = normalize_value(prev_item.get('出発時間（予定）')) or normalize_value(prev_item.get('到着時間（予定）'))
             
-            if curr_key == prev_key:
-                # 同じフライトの出発時間（実際）を比較
+            # 同じ便名・日付・予定時間のフライトを検索
+            if curr_flight_name == prev_flight_name and curr_date == prev_date and curr_scheduled == prev_scheduled:
+                # 実際の時間を比較
                 prev_actual = normalize_value(prev_item.get('出発時間（実際）')) or normalize_value(prev_item.get('到着時間（実際）'))
                 curr_actual = normalize_value(curr_item.get('出発時間（実際）')) or normalize_value(curr_item.get('到着時間（実際）'))
                 
                 if prev_actual != curr_actual:
-                    changes.append(f"時間変更: {curr_key[0]}")
+                    # 時間変更を検出
                     prev_str = prev_actual if prev_actual is not None else "未定"
                     curr_str = curr_actual if curr_actual is not None else "未定"
-                    print(f"  ⚠ 時間変更: {curr_key[0]} ({curr_key[1]}) {prev_str} → {curr_str}")
+                    print(f"  ⏰ 時間変更: {curr_flight_name} ({curr_date}) {prev_str} → {curr_str}")
+                    
                     # 変更後のデータを追加
                     item = curr_item.copy()
                     item['変更種別'] = '時間変更'
                     item['前回時間'] = prev_str
                     changed_items.append(item)
+                    time_changes.add(curr_flight_name)
+                break
+    
+    if time_changes:
+        changes.append(f"時間変更: {len(time_changes)}件")
 
     
     if changes:
