@@ -252,20 +252,28 @@ class IncheonCargoScraper:
                         if col1:
                             # 予定時間を取得（strong要素内）
                             time_elem = col1.find('strong')
+                            original_scheduled = None
                             if time_elem:
-                                scheduled_time = time_elem.get_text(strip=True)
-                                row_data[time_key_scheduled] = scheduled_time
+                                original_scheduled = time_elem.get_text(strip=True)
                             
                             # 実際の時間を取得（span要素内）
                             # time divの中のspanを探す
+                            actual_time = None
                             time_div = col1.find('div', class_='time')
                             if time_div:
                                 # span要素を直接探す
                                 time_span = time_div.find('span')
                                 if time_span:
                                     actual_time = time_span.get_text(strip=True)
-                                    if actual_time:
-                                        row_data[time_key_actual] = actual_time
+                            
+                            # 実際の時間が存在する場合、時間を入れ替える
+                            # 予定 ← 実際の時間、実際 ← もともとの予定時間
+                            if actual_time:
+                                row_data[time_key_scheduled] = actual_time
+                                row_data[time_key_actual] = original_scheduled
+                            else:
+                                # 実際の時間がない場合は予定時間のみ
+                                row_data[time_key_scheduled] = original_scheduled
                         
                         # 目的地または出発地
                         col2 = toggle_row.find('div', class_='col2')
@@ -675,11 +683,22 @@ class IncheonCargoScraper:
                         
                         # 時間変更の場合は前回の時間も表示
                         if change_type == '時間変更':
-                            prev_time = row.get('前回時間', '')
-                            flight_info += f"  🕐 予定{time_label}: {scheduled}\n"
-                            if prev_time:
-                                flight_info += f"  ⏰ 前回: {prev_time} → **{actual}**\n"
+                            prev_scheduled = row.get('前回予定時間', '')
+                            prev_actual = row.get('前回実際時間', '')
+                            
+                            # 予定時間の変更
+                            if prev_scheduled and prev_scheduled != scheduled:
+                                flight_info += f"  🕐 予定{time_label}: {prev_scheduled} → **{scheduled}**\n"
                             else:
+                                flight_info += f"  🕐 予定{time_label}: {scheduled}\n"
+                            
+                            # 実際の時間の変更
+                            if prev_actual and prev_actual != actual:
+                                if actual and isinstance(actual, str):
+                                    flight_info += f"  ⏰ 実{time_label}: {prev_actual} → **{actual}**\n"
+                                else:
+                                    flight_info += f"  ⏰ 実{time_label}: {prev_actual} → 未定\n"
+                            elif actual and isinstance(actual, str):
                                 flight_info += f"  🕐 実{time_label}: **{actual}**\n"
                         elif actual and isinstance(actual, str) and actual != scheduled:
                             # 予定と実際が異なる場合
