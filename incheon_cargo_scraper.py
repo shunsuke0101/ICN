@@ -250,16 +250,22 @@ class IncheonCargoScraper:
                         # 時間（出発または到着）
                         col1 = toggle_row.find('div', class_='col1')
                         if col1:
+                            # 予定時間を取得（strong要素内）
                             time_elem = col1.find('strong')
                             if time_elem:
                                 scheduled_time = time_elem.get_text(strip=True)
                                 row_data[time_key_scheduled] = scheduled_time
                             
-                            # 実際の時間（spanがあれば）
-                            time_span = col1.find('span')
-                            if time_span:
-                                actual_time = time_span.get_text(strip=True)
-                                row_data[time_key_actual] = actual_time
+                            # 実際の時間を取得（span要素内）
+                            # time divの中のspanを探す
+                            time_div = col1.find('div', class_='time')
+                            if time_div:
+                                # span要素を直接探す
+                                time_span = time_div.find('span')
+                                if time_span:
+                                    actual_time = time_span.get_text(strip=True)
+                                    if actual_time:
+                                        row_data[time_key_actual] = actual_time
                         
                         # 目的地または出発地
                         col2 = toggle_row.find('div', class_='col2')
@@ -450,6 +456,14 @@ class IncheonCargoScraper:
         
         # DataFrameに変換
         df = pd.DataFrame(cargo_data)
+        
+        # 必須の列が存在することを保証（実際の時間が存在しない場合でも列を作成）
+        time_key_scheduled = '出発時間（予定）' if flight_type == 'departure' else '到着時間（予定）'
+        time_key_actual = '出発時間（実際）' if flight_type == 'departure' else '到着時間（実際）'
+        
+        if time_key_actual not in df.columns:
+            df[time_key_actual] = None
+        
         print(f"\n✓ 取得したデータ: {len(df)} 件")
         
         # データを保存
