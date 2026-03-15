@@ -587,226 +587,197 @@ class IncheonCargoScraper:
         ---------------------------------------------------------------------
         メソッド概要：  Discordに通知を送信
         - Webhook経由でフライト情報を送信
-        - リッチエンベッド形式で見やすく表示
+        - ヘッダーembedと日付ごとのembedにフライトをfieldとして表示
+        - 10 embeds/message、25 fields/embed の制限に対応して複数回送信
         ----------------------------------------------------------------------
         Args:
             df (pd.DataFrame): 送信するデータ
-            start_date (str): 開始日
-            end_date (str): 終了日
+            start_date (str): 開始日 (YYYYMMDD)
+            end_date (str): 終了日 (YYYYMMDD)
             airport (str): 空港コード (デフォルト: NGO)
             flight_type (str): フライトタイプ ('departure' or 'arrival')
         ---------------------------------------------------------------------
         Returns:
-            bool: 送信成功時True
+            bool: 全バッチ送信成功時True
         ---------------------------------------------------------------------
         Notes:
             - author         GitHub Copilot
-            - revision       v1.01 (2025/11/01) - 到着便対応追加
+            - revision       v2.00 (2026/03/15) - embed/field形式にリファクタリング
         ---------------------------------------------------------------------
         """
         if not self.discord_webhook_url:
             print("エラー: Discord Webhook URLが設定されていません")
             print("環境変数 DISCORD_WEBHOOK_URL を設定するか、初期化時に指定してください")
             return False
-        
+
         if df is None or len(df) == 0:
             print("送信するデータがありません")
             return False
-        
+
         try:
-            # フライトタイプに応じてタイトルと絵文字を設定
+            # ── フライトタイプ別設定 ──────────────────────────────────────────
             if flight_type == 'departure':
-                emoji = "🛫"
-                type_ja = "出発"
+                emoji    = "🛫"
+                type_ja  = "出発"
                 time_key_scheduled = '出発時間（予定）'
-                time_key_actual = '出発時間（実際）'
-                location_key = '目的地'
-                status_key = '出発状態'
+                time_key_actual    = '出発時間（実際）'
+                location_key       = '目的地'
+                status_key         = '出発状態'
+                color = 3447003    # 青
             else:
-                emoji = "🛬"
-                type_ja = "到着"
+                emoji    = "🛬"
+                type_ja  = "到着"
                 time_key_scheduled = '到着時間（予定）'
-                time_key_actual = '到着時間（実際）'
-                location_key = '出発地'
-                status_key = '到着状態'
-            
-            # メッセージを構築
-            title = f"{emoji} 仁川国際空港 貨物{type_ja}スケジュール"
-            
-            # 変更種別があるかチェック（hourly_checkから呼ばれた場合）
+                time_key_actual    = '到着時間（実際）'
+                location_key       = '出発地'
+                status_key         = '到着状態'
+                color = 15844367   # 金
+
             has_change_type = '変更種別' in df.columns if hasattr(df, 'columns') else False
-            
-            if has_change_type:
-                description = f"**期間**: {start_date} ~ {end_date}\n**空港**: {airport}\n**変更件数**: {len(df)}件\n\n"
-            else:
-                description = f"**期間**: {start_date} ~ {end_date}\n**空港**: {airport}\n**取得件数**: {len(df)}件\n\n"
-            
-            # データをグループ化して整形
-            if '取得日' in df.columns:
-                grouped = df.groupby('取得日')
-                for date, group in grouped:
-                    date_formatted = f"{date[:4]}/{date[4:6]}/{date[6:]}"
-                    description += f"**📅 {date_formatted}**\n"
-                    
-                    for idx, row in group.iterrows():
-                        # 変更種別の表示
-                        change_type = row.get('変更種別', '')
-                        if change_type:
-                            if change_type == '新規':
-                                change_icon = "🆕"
-                            elif change_type == '削除':
-                                change_icon = "🗑️"
-                            elif change_type == '時間変更':
-                                change_icon = "⏰"
-                            else:
-                                change_icon = "📝"
-                            change_prefix = f"{change_icon} **[{change_type}]** "
-                        else:
-                            change_prefix = ""
-                        
-                        # 便名と航空会社
-                        flight_num = row.get('便名', 'N/A')
-                        airline = row.get('航空会社', 'N/A')
-                        flight_info = f"{change_prefix}✈️ **{flight_num}** ({airline})\n"
-                        
-                        # 目的地または出発地
-                        location = row.get(location_key, 'N/A')
-                        if isinstance(location, str):
-                            location_label = "目的地" if flight_type == 'departure' else "出発地"
-                            flight_info += f"  📍 {location_label}: {location}\n"
-                        
-                        # 時間情報
-                        scheduled = row.get(time_key_scheduled, 'N/A')
-                        actual = row.get(time_key_actual, '')
-                        
-                        time_label = f"{type_ja}時間"
-                        
-                        # 時間変更の場合は前回の時間も表示
-                        if change_type == '時間変更':
-                            prev_scheduled = row.get('前回予定時間', '')
-                            prev_actual = row.get('前回実際時間', '')
-                            
-                            # 予定時間の変更
-                            if prev_scheduled and prev_scheduled != scheduled:
-                                flight_info += f"  🕐 予定{time_label}: {prev_scheduled} → **{scheduled}**\n"
-                            else:
-                                flight_info += f"  🕐 予定{time_label}: {scheduled}\n"
-                            
-                            # 実際の時間の変更
-                            if prev_actual and prev_actual != actual:
-                                if actual and isinstance(actual, str):
-                                    flight_info += f"  ⏰ 実{time_label}: {prev_actual} → **{actual}**\n"
-                                else:
-                                    flight_info += f"  ⏰ 実{time_label}: {prev_actual} → 未定\n"
-                            elif actual and isinstance(actual, str):
-                                flight_info += f"  🕐 実{time_label}: **{actual}**\n"
-                        elif actual and isinstance(actual, str) and actual != scheduled:
-                            # 予定と実際が異なる場合
-                            flight_info += f"  🕐 予定{time_label}: {scheduled}\n"
-                            flight_info += f"  🕐 実{time_label}: **{actual}**\n"
-                        else:
-                            # 予定のみの場合
-                            flight_info += f"  🕐 予定{time_label}: {scheduled}\n"
-                        
-                        # 駐機場
-                        gate = row.get('駐機場', 'N/A')
-                        if gate and gate != 'N/A' and isinstance(gate, str):
-                            flight_info += f"  🚪 駐機場: {gate}\n"
-                        
-                        # ターミナル
-                        terminal = row.get('ターミナル', '')
-                        if terminal and terminal != 'N/A' and isinstance(terminal, str):
-                            flight_info += f"  🏢 ターミナル: {terminal}\n"
-                        
-                        # 状態
-                        status = row.get(status_key, '')
-                        if status and isinstance(status, str):
-                            status_icon = "✅" if type_ja in status else "⏳"
-                            flight_info += f"  {status_icon} 状態: {status}\n"
-                        
-                        description += flight_info + "\n"
-                    
-                    description += ""
-            else:
-                for idx, row in df.iterrows():
-                    # 便名と航空会社
-                    flight_num = row.get('便名', 'N/A')
-                    airline = row.get('航空会社', 'N/A')
-                    flight_info = f"✈️ **{flight_num}** ({airline})\n"
-                    
-                    # 目的地
-                    destination = row.get('目的地', 'N/A')
-                    if isinstance(destination, str):
-                        flight_info += f"  📍 目的地: {destination}\n"
-                    
-                    # 出発時間情報
-                    scheduled = row.get('出発時間（予定）', 'N/A')
-                    actual = row.get('出発時間（実際）', '')
-                    
+
+            def fmt_date(d):
+                """YYYYMMDD → YYYY/MM/DD"""
+                return f"{d[:4]}/{d[4:6]}/{d[6:]}"
+
+            # ── 1フライト分の embed field (name, value) を生成 ───────────────
+            def build_flight_field(row):
+                change_type = row.get('変更種別', '')
+                change_icon = {'新規': '🆕', '時間変更': '⏰'}.get(change_type, '✈️')
+
+                flight_num = row.get('便名', 'N/A')
+                airline    = row.get('航空会社', 'N/A')
+                badge      = f"[{change_type}] " if change_type else ""
+                field_name = f"{change_icon} {badge}{flight_num}  ({airline})"
+
+                lines = []
+
+                # 目的地 / 出発地
+                location = row.get(location_key, '')
+                if location and location != 'N/A':
+                    loc_label = "目的地" if flight_type == 'departure' else "出発地"
+                    lines.append(f"📍 **{loc_label}**: {location}")
+
+                # 時間情報
+                scheduled = row.get(time_key_scheduled, '')
+                actual    = row.get(time_key_actual, '')
+
+                if change_type == '時間変更':
+                    prev_scheduled = row.get('前回予定時間', '')
+                    prev_actual    = row.get('前回実際時間', '')
+
+                    if prev_scheduled and prev_scheduled != scheduled:
+                        lines.append(f"🕐 予定: ~~{prev_scheduled}~~ → **{scheduled}**")
+                    elif scheduled:
+                        lines.append(f"🕐 予定: {scheduled}")
+
+                    if prev_actual and prev_actual != actual:
+                        new_act = f"**{actual}**" if actual and isinstance(actual, str) else "未定"
+                        lines.append(f"⏰ 実際: ~~{prev_actual}~~ → {new_act}")
+                    elif actual and isinstance(actual, str):
+                        lines.append(f"⏰ 実際: **{actual}**")
+                else:
+                    if scheduled:
+                        lines.append(f"🕐 予定: {scheduled}")
                     if actual and isinstance(actual, str) and actual != scheduled:
-                        # 予定と実際が異なる場合
-                        flight_info += f"  🕐 予定出発時間: {scheduled}\n"
-                        flight_info += f"  🕐 実出発時間: **{actual}**\n"
-                    else:
-                        # 予定のみの場合
-                        flight_info += f"  🕐 予定出発時間: {scheduled}\n"
-                    
-                    # 駐機場
-                    gate = row.get('駐機場', 'N/A')
-                    if gate and gate != 'N/A' and isinstance(gate, str):
-                        flight_info += f"  🚪 駐機場: {gate}\n"
-                    
-                    # ターミナル
-                    terminal = row.get('ターミナル', '')
-                    if terminal and terminal != 'N/A' and isinstance(terminal, str):
-                        flight_info += f"  🏢 ターミナル: {terminal}\n"
-                    
-                    # 出発状態
-                    status = row.get('出発状態', '')
-                    if status and isinstance(status, str):
-                        status_icon = "✅" if "出発" in status else "⏳"
-                        flight_info += f"  {status_icon} 状態: {status}\n"
-                    
-                    description += flight_info + "\n"
-            
-            # Discordのメッセージ長制限（2000文字）を考慮
-            if len(description) > 1900:
-                description = description[:1900] + "\n...(省略)"
-            
-            # Embedを使用してリッチな通知を作成
-            embed = {
-                "title": title,
-                "description": description,
-                "color": 3447003,  # 青色
-                "footer": {
-                    "text": f"取得日時: {datetime.now().strftime('%Y/%m/%d %H:%M:%S')}"
-                }
+                        lines.append(f"⏰ 実際: **{actual}**")
+
+                # 駐機場
+                gate = row.get('駐機場', '')
+                if gate and gate != 'N/A' and isinstance(gate, str):
+                    lines.append(f"🚪 駐機場: {gate}")
+
+                # ターミナル
+                terminal = row.get('ターミナル', '')
+                if terminal and terminal != 'N/A' and isinstance(terminal, str):
+                    lines.append(f"🏢 ターミナル: {terminal}")
+
+                # 状態
+                status = row.get(status_key, '')
+                if status and isinstance(status, str):
+                    status_icon = "✅" if type_ja in status else "⏳"
+                    lines.append(f"{status_icon} 状態: {status}")
+
+                field_value = "\n".join(lines) if lines else "情報なし"
+                return field_name[:256], field_value[:1024]
+
+            # ── embedリストを構築 ──────────────────────────────────────────────
+            MAX_FIELDS_PER_EMBED = 25
+            MAX_EMBEDS_PER_MSG   = 10
+
+            count_label = "変更件数" if has_change_type else "取得件数"
+            header_embed = {
+                "title":       f"{emoji} 仁川国際空港 貨物{type_ja}スケジュール",
+                "description": (
+                    f"**期間**: {fmt_date(start_date)} 〜 {fmt_date(end_date)}\n"
+                    f"**空港**: {airport}\n"
+                    f"**{count_label}**: {len(df)}件"
+                ),
+                "color": color,
             }
-            
-            payload = {
-                "embeds": [embed]
-            }
-            
-            # Discord Webhookに送信
-            print(f"  Webhook URL: {self.discord_webhook_url[:50]}...")
-            print(f"  メッセージ長: {len(description)}文字")
-            
-            response = requests.post(
-                self.discord_webhook_url,
-                json=payload,
-                headers={'Content-Type': 'application/json'},
-                timeout=10
-            )
-            
-            if response.status_code == 204:
-                print("✓ Discordへの通知送信成功")
-                return True
+            all_embeds = [header_embed]
+
+            def new_date_embed(title):
+                return {"title": title, "color": color, "fields": []}
+
+            if '取得日' in df.columns:
+                for date, group in df.groupby('取得日'):
+                    current_embed = new_date_embed(f"📅 {fmt_date(date)}")
+                    part = 1
+                    for _, row in group.iterrows():
+                        if len(current_embed["fields"]) >= MAX_FIELDS_PER_EMBED:
+                            all_embeds.append(current_embed)
+                            part += 1
+                            current_embed = new_date_embed(f"📅 {fmt_date(date)} （続き {part}）")
+                        fname, fval = build_flight_field(row)
+                        current_embed["fields"].append({"name": fname, "value": fval, "inline": False})
+                    if current_embed["fields"]:
+                        all_embeds.append(current_embed)
             else:
-                print(f"✗ エラー: Discord通知送信失敗")
-                print(f"  ステータスコード: {response.status_code}")
-                print(f"  レスポンス: {response.text}")
-                return False
-                
+                current_embed = new_date_embed("📅 スケジュール")
+                part = 1
+                for _, row in df.iterrows():
+                    if len(current_embed["fields"]) >= MAX_FIELDS_PER_EMBED:
+                        all_embeds.append(current_embed)
+                        part += 1
+                        current_embed = new_date_embed(f"📅 スケジュール （続き {part}）")
+                    fname, fval = build_flight_field(row)
+                    current_embed["fields"].append({"name": fname, "value": fval, "inline": False})
+                if current_embed["fields"]:
+                    all_embeds.append(current_embed)
+
+            # フッターは最後のembedに付与
+            all_embeds[-1]["footer"] = {
+                "text": f"取得日時: {datetime.now().strftime('%Y/%m/%d %H:%M:%S')}"
+            }
+
+            # ── 10 embeds ずつ送信 ────────────────────────────────────────────
+            print(f"  Webhook URL: {self.discord_webhook_url[:50]}...")
+            print(f"  送信embed数: {len(all_embeds)}")
+
+            success = True
+            for batch_start in range(0, len(all_embeds), MAX_EMBEDS_PER_MSG):
+                batch = all_embeds[batch_start:batch_start + MAX_EMBEDS_PER_MSG]
+                response = requests.post(
+                    self.discord_webhook_url,
+                    json={"embeds": batch},
+                    headers={'Content-Type': 'application/json'},
+                    timeout=10
+                )
+                batch_num = batch_start // MAX_EMBEDS_PER_MSG + 1
+                if response.status_code == 204:
+                    print(f"✓ Discord通知送信成功（バッチ {batch_num}）")
+                else:
+                    print(f"✗ エラー: Discord通知送信失敗（バッチ {batch_num}）")
+                    print(f"  ステータスコード: {response.status_code}")
+                    print(f"  レスポンス: {response.text}")
+                    success = False
+
+                # レート制限を避けるため、次のバッチ前に少し待機
+                if batch_start + MAX_EMBEDS_PER_MSG < len(all_embeds):
+                    time.sleep(0.5)
+
+            return success
+
         except Exception as e:
             print(f"✗ エラー: Discord通知送信中に例外が発生")
             print(f"  例外内容: {e}")
