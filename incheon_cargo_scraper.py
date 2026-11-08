@@ -24,6 +24,7 @@ import pandas as pd
 from datetime import datetime, timedelta
 import time
 import json
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlencode
 import re
 import os
@@ -551,22 +552,32 @@ class IncheonCargoScraper:
         ---------------------------------------------------------------------
         """
         all_data = []
-        
+
         start = datetime.strptime(start_date, '%Y%m%d')
         end = datetime.strptime(end_date, '%Y%m%d')
-        
+        dates = []
         current = start
         while current <= end:
-            date_str = current.strftime('%Y%m%d')
-            print(f"\n--- {date_str} のデータを取得中 ---")
-            
-            df = self.scrape(date_str, airport, output_format=None, save_html=False, flight_type=flight_type)
+            dates.append(current.strftime('%Y%m%d'))
+            current += timedelta(days=1)
+
+        # v3.00: 日付ごとの取得を並列化（最大 3 同時）。従来の「1 日ごとに 2 秒待機」は廃止
+        def _one(date_str):
+            try:
+                return date_str, self.scrape(date_str, airport, output_format=None, save_html=False, flight_type=flight_type)
+            except Exception as e:  # noqa: BLE001
+                print(f"  [{date_str}] 取得失敗: {e}")
+                return date_str, None
+
+        t0 = time.perf_counter()
+        with ThreadPoolExecutor(max_workers=min(3, len(dates))) as ex:
+            results = list(ex.map(_one, dates))
+        print(f"\n{len(dates)} 日分を {time.perf_counter() - t0:.1f} 秒で取得")
+
+        for date_str, df in results:
             if df is not None and len(df) > 0:
                 df['取得日'] = date_str
                 all_data.append(df)
-            
-            current += timedelta(days=1)
-            time.sleep(2)  # サーバーに負荷をかけないよう待機
         
         if all_data:
             combined_df = pd.concat(all_data, ignore_index=True)
@@ -701,58 +712,74 @@ class IncheonCargoScraper:
         # 名古屋側の時刻
         base = actual_dt or sched_dt
         if cancelled or base is None:
-            ngo_txt = "--:--"
+            ngo_dt = None
         elif is_dep:
-            ngo_txt = self._hhmm_rel(base + timedelta(minutes=self.FLIGHT_MIN_ICN_NGO), ref, True)
+            ngo_dt = base + timedelta(minutes=self.FLIGHT_MIN_ICN_NGO)
         else:
-            ngo_txt = self._hhmm_rel(base - timedelta(minutes=self.FLIGHT_MIN_NGO_ICN), ref, True)
+            ngo_dt = base - timedelta(minutes=self.FLIGHT_MIN_NGO_ICN)
 
-        # 経由・最終目的地の注記
+        # 経路
         code, via = self._airport_code(row.get(loc_key, ''))
-        note = ''
-        if code and code != 'NGO':
-            note = f" (→{code})" if is_dep else f" ({code}→)"
-        elif via:
-            note = " (経由)"
-
-        fcode = self._flight_code(row.get('便名', ''))
         if is_dep:
-            left, right = f"ICN {sched_txt}", f"NGO {ngo_txt}"
+            route = "ICN → NGO" + (f" → {code}" if code and code != 'NGO' else "")
         else:
-            left, right = f"NGO {ngo_txt}", f"ICN {sched_txt}"
-        return f"{left:<12} {fcode:<8} {right:<12} {status}{note}"
+            route = (f"{code} → " if code and code != 'NGO' else "") + "NGO → ICN"
 
-    def _build_blocks(self, df, flight_type, today):
-        """日付ごとに見出しを付けたコードブロック文字列のリスト（4000 字以内に分割）"""
+        # 1 便 = 埋め込みフィールド 1 枠
+        badge = {"新規": "🆕 ", "時間変更": "🔔 "}.get(change_type, "")
+        icon = "🛫" if is_dep else "🛬"
+        fcode = self._flight_code(row.get('便名', ''))
+        name = f"{badge}{icon} {fcode}"
+        icn_line = f"ICN {self._fmt_md(sched_dt)} {sched_txt} KST"
+        ngo_line = "NGO --/-- --:-- JST" if ngo_dt is None else f"NGO {self._fmt_md(ngo_dt)} {ngo_dt:%H:%M} JST (推定)"
+        if is_dep:
+            times = [f"`🛫 {icn_line}`", f"`🛬 {ngo_line}`"]
+        else:
+            times = [f"`🛫 {ngo_line}`", f"`🛬 {icn_line}`"]
+        value = "\n".join([route, *times, status])
+        return {"name": name[:256], "value": value[:1024], "inline": False}
+
+    def _fmt_md(self, d):
+        """11/09(月) 形式"""
+        return "--/--" if d is None else f"{d:%m/%d}({self.WEEKDAY_JA[d.weekday()]})"
+
+    @staticmethod
+    def _ngo_time_suffix(txt):
+        """'05:40*+1' → ' (翌日・推定)'"""
+        parts = []
+        if "+1" in txt:
+            parts.append("翌日")
+        elif "-1" in txt:
+            parts.append("前日")
+        if "*" in txt:
+            parts.append("推定")
+        return f" ({'・'.join(parts)})" if parts else ""
+
+    def _build_fields(self, df, flight_type, today):
+        """便ごとのフィールド一覧（日付・予定時刻順）"""
         sched_key = '出発時間（予定）' if flight_type == 'departure' else '到着時間（予定）'
-        rows = []
+        fields, cur = [], None
         if '取得日' in df.columns:
             df = df.sort_values(['取得日', sched_key], kind='stable') if sched_key in df.columns else df.sort_values('取得日')
-            cur = None
-            for _, row in df.iterrows():
-                d = str(row.get('取得日', ''))
-                if d != cur:
-                    cur = d
-                    if rows:
-                        rows.append("")
-                    rows.append(f"[{self._day_label(d, today)}]")
-                rows.append(self._format_row(row, flight_type, today))
-        else:
-            for _, row in df.iterrows():
-                rows.append(self._format_row(row, flight_type, today))
+        for _, row in df.iterrows():
+            d = str(row.get('取得日', '') or '')
+            if d and d != cur:
+                cur = d
+                fields.append({"name": f"━━ {self._day_label(d, today)} ━━", "value": "\u200b", "inline": False})
+            fields.append(self._format_row(row, flight_type, today))
+        return fields
 
-        blocks, cur_lines, cur_len = [], [], 0
-        for line in rows:
-            if cur_len + len(line) + 1 > 3900 and cur_lines:
-                blocks.append("```\n" + "\n".join(cur_lines) + "\n```")
-                cur_lines, cur_len = [], 0
-                if line == "":
-                    continue
-            cur_lines.append(line)
-            cur_len += len(line) + 1
-        if cur_lines:
-            blocks.append("```\n" + "\n".join(cur_lines) + "\n```")
-        return blocks or ["```\n該当便なし\n```"]
+    @staticmethod
+    def _fields_to_text(fields):
+        if not fields:
+            return "  該当便なし"
+        out = []
+        for f in fields:
+            if f["value"] == "\u200b":
+                out.append(f" {f['name']}")
+            else:
+                out.append(f"  {f['name']}\n" + "\n".join("    " + l for l in f["value"].splitlines()))
+        return "\n".join(out)
 
     def send_discord_notification(self, df, start_date, end_date, airport='NGO', flight_type='departure'):
         """
@@ -797,16 +824,15 @@ class IncheonCargoScraper:
             title = f"{kind}  {route}  ({len(df)} 件{what})"
             period = f"{self._day_label(start_date, today)} 〜 {self._day_label(end_date, today)}"
 
-            blocks = self._build_blocks(df, flight_type, today)
-            embeds = []
-            for i, b in enumerate(blocks):
-                e = {"title": title if i == 0 else f"{title} （続き {i + 1}）", "description": b, "color": color}
-                embeds.append(e)
+            fields = self._build_fields(df, flight_type, today)
+            print(self._fields_to_text(fields))
+            embeds = [{"title": title if i == 0 else f"{title} （続き）", "color": color, "fields": fields[i:i + 24]}
+                      for i in range(0, len(fields), 24)] or [{"title": title, "description": "該当便なし", "color": color}]
             embeds[-1]["footer"] = {
-                "text": f"ICN=韓国時間 / NGO=日本時間（同じ UTC+9） ・ *=推定 ・ +1=翌日 ・ 更新 {datetime.now():%m/%d %H:%M} JST"
+                "text": f"KST=韓国時間 / JST=日本時間（同じ UTC+9） ・ 推定=標準所要時間からの概算 ・ 🔔=時間変更 ・ 🆕=新規 ・ 更新 {datetime.now():%m/%d %H:%M} JST"
             }
             content = (f"**ICN ⇄ {airport} カーゴ便{'（変更あり）' if has_change_type else ''}  |  {kind} {len(df)} 件**\n"
-                       f"対象期間: {period}  (左 = 出発地・出発時刻 / 右 = 到着地・到着時刻)")
+                       f"対象期間: {period}")
 
             MAX_EMBEDS_PER_MSG = 10
             print(f"  Webhook URL: {self.discord_webhook_url[:50]}...")
