@@ -697,17 +697,15 @@ class IncheonCargoScraper:
             status = status_raw
         else:
             status = "定刻"
-        if change_type == '新規':
-            status = "新規 " + status
-        elif change_type == '時間変更':
-            prev_s = row.get('前回予定時間', '')
-            prev_a = row.get('前回実際時間', '')
-            if self._is_str(prev_s) and prev_s.strip() != (sched_raw or '').strip():
-                status = f"変更 {prev_s.strip()}→{sched_txt}"
-            elif self._is_str(prev_a):
-                status = f"{status} (前回 {prev_a.strip()})"
-            else:
-                status = "変更 " + status
+        # 見やすい状態文（hourly_check の差分情報があれば前回値も添える）
+        kind = {'新規': 'new', '時間変更': 'changed'}.get(change_type, '')
+        prev_s = row.get('前回予定時間', '')
+        prev_a = row.get('前回実際時間', '')
+        prev_sched = prev_s.strip() if self._is_str(prev_s) and prev_s.strip() != (sched_raw or '').strip() else None
+        prev_status = None
+        if kind == 'changed':
+            prev_status = f"{tag} {prev_a.strip()}" if self._is_str(prev_a) else "定刻"
+        status = self._pretty_status(status, sched_txt, is_dep, prev_status, prev_sched, kind)
 
         # 名古屋側の時刻
         base = actual_dt or sched_dt
@@ -729,7 +727,7 @@ class IncheonCargoScraper:
         badge = {"新規": "🆕 ", "時間変更": "🔔 "}.get(change_type, "")
         icon = "🛫" if is_dep else "🛬"
         fcode = self._flight_code(row.get('便名', ''))
-        name = f"{badge}{icon} {fcode}"
+        name = f"{badge}{icon} {fcode} ｜ {self._day_label(date_str, today)}"
         icn_line = f"ICN {self._fmt_md(sched_dt)} {sched_txt} KST"
         ngo_line = "NGO --/-- --:-- JST" if ngo_dt is None else f"NGO {self._fmt_md(ngo_dt)} {ngo_dt:%H:%M} JST (推定)"
         if is_dep:
@@ -738,6 +736,53 @@ class IncheonCargoScraper:
             times = [f"`🛫 {ngo_line}`", f"`🛬 {icn_line}`"]
         value = "\n".join([route, *times, status])
         return {"name": name[:256], "value": value[:1024], "inline": False}
+
+    @staticmethod
+    def _mins_diff(a, b):
+        """'04:37' - '04:35' → +2（日またぎは ±12h 以内で補正）"""
+        try:
+            ha, ma = map(int, a[:5].split(":")); hb, mb = map(int, b[:5].split(":"))
+        except ValueError:
+            return None
+        d = (ha * 60 + ma) - (hb * 60 + mb)
+        if d > 720:
+            d -= 1440
+        elif d < -720:
+            d += 1440
+        return d
+
+    def _pretty_status(self, status, sched_txt, is_dep, prev_status, prev_sched, kind):
+        """'定刻' / '出発済 04:37' / '遅延' / '欠航' / その他 → 見やすい表示
+        例: ✅ 出発済み 04:37（予定 04:35、+2分） / 🟢 定刻どおり
+        """
+        s = status.strip()
+        tag = "出発" if is_dep else "到着"
+
+        def delta(tm):
+            d = self._mins_diff(tm, sched_txt)
+            if d is None:
+                return ""
+            return "、定刻" if d == 0 else f"、{d:+d}分"
+
+        if s == "定刻":
+            line = "🟢 定刻どおり"
+        elif s.startswith(("出発済", "到着済")):
+            actual = s.split(" ", 1)[1] if " " in s else ""
+            line = f"✅ {tag}済み {actual}（予定 {sched_txt}{delta(actual)}）" if actual else f"✅ {tag}済み"
+        elif s == "遅延":
+            line = "🟠 遅延"
+        elif s == "欠航":
+            line = "🔴 欠航"
+        else:
+            line = f"🔵 {s}"
+        if kind == "new":
+            line += "\n🆕 新しく追加された便"
+        elif kind == "changed":
+            if prev_sched:
+                line += f"\n🔔 前回: 予定 {prev_sched}・{prev_status or '?'}"
+            else:
+                line += f"\n🔔 前回: {prev_status or '?'}"
+        return line
 
     def _fmt_md(self, d):
         """11/09(月) 形式"""
@@ -762,10 +807,6 @@ class IncheonCargoScraper:
         if '取得日' in df.columns:
             df = df.sort_values(['取得日', sched_key], kind='stable') if sched_key in df.columns else df.sort_values('取得日')
         for _, row in df.iterrows():
-            d = str(row.get('取得日', '') or '')
-            if d and d != cur:
-                cur = d
-                fields.append({"name": f"━━ {self._day_label(d, today)} ━━", "value": "\u200b", "inline": False})
             fields.append(self._format_row(row, flight_type, today))
         return fields
 
@@ -829,7 +870,7 @@ class IncheonCargoScraper:
             embeds = [{"title": title if i == 0 else f"{title} （続き）", "color": color, "fields": fields[i:i + 24]}
                       for i in range(0, len(fields), 24)] or [{"title": title, "description": "該当便なし", "color": color}]
             embeds[-1]["footer"] = {
-                "text": f"KST=韓国時間 / JST=日本時間（同じ UTC+9） ・ 推定=標準所要時間からの概算 ・ 🔔=時間変更 ・ 🆕=新規 ・ 更新 {datetime.now():%m/%d %H:%M} JST"
+                "text": f"KST=韓国時間 / JST=日本時間（同じ UTC+9） ・ 推定=標準所要時間からの概算 ・ 🔔=前回通知から変化 ・ 更新 {datetime.now():%m/%d %H:%M} JST"
             }
             content = (f"**ICN ⇄ {airport} カーゴ便{'（変更あり）' if has_change_type else ''}  |  {kind} {len(df)} 件**\n"
                        f"対象期間: {period}")
