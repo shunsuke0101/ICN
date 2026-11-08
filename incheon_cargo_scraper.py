@@ -4,19 +4,21 @@
 # @brief          仁川国際空港 貨物出発・到着スケジュール スクレイピングシステム
 # @author         Kidera Shunsuke
 # @date           2025/11/01
-# $Version:       3.01
-# $Revision:      2026/11/08
+# $Version:       3.02
+# $Revision:      2026/11/09
 # @note           仁川国際空港の貨物出発・到着スケジュールをWebスクレイピング
 #                 Discord Webhook通知機能を含む
 # @attention      プロジェクトのコーディングフォーマット・コメントフォーマット遵守
 #                 出発便APIエンドポイント: https://www.airport.kr/depCargo/ap_ja/depCargoSchList.do
 #                 到着便APIエンドポイント: https://www.airport.kr/arrCargo/ap_ja/arrCargoSchList.do
 #                 データ構造: div.data > div.body > div.group > div.row
+#                 駐機場: div.jugi、状態: div.state（列番号は出発便 col5/col6・到着便 col6/col7 と異なる）
 # @par            History
 #                 v1.00 (2025/11/01) - 初期実装・Discord通知機能追加
 #                 v1.01 (2025/11/01) - 到着便データ取得機能追加・CSV出力デフォルト無効化
 #                 v3.00 (2026/11/08) - Discord 通知を Changi 通知と共通の表形式に変更
 #                 v3.01 (2026/11/08) - コメントフォーマットの統一
+#                 v3.02 (2026/11/09) - 駐機場をクラス名で取得（到着便の列ずれ修正）・通知に駐機場を表示
 # Copyright (c) 2025-2026. All Rights reserved.
 #
 # -----------------------------------------------------------------------------------#
@@ -260,6 +262,7 @@ class IncheonCargoScraper:
         Notes:
             - author         Kidera-Shunsuke
             - revision       v1.01 (2025/11/01) - 到着便対応追加
+            - revision       v3.02 (2026/11/09) - 駐機場・状態をクラス名（jugi / state）で取得
         ----------------------------------------------------------------------
         """
         cargo_data = []
@@ -375,23 +378,26 @@ class IncheonCargoScraper:
                             if terminal:
                                 row_data['ターミナル'] = terminal
                         
-                        # 駐機場
-                        col5 = toggle_row.find('div', class_='col5')
-                        if col5:
+                        # 駐機場（v3.02: 列番号ではなくクラス名で特定）
+                        #   出発便は col5、到着便は col6 に入っており列番号が異なるため、
+                        #   div.jugi（駐機場）/ div.state（状態）をクラス名で探す。
+                        #   見つからない場合は従来の col5 / col6 にフォールバック。
+                        stand_div = toggle_row.find('div', class_='jugi') or toggle_row.find('div', class_='col5')
+                        if stand_div:
                             # hidden-textを除外
-                            for hidden in col5.find_all('i', class_='hidden-text'):
+                            for hidden in stand_div.find_all('i', class_='hidden-text'):
                                 hidden.decompose()
-                            gate = col5.get_text(strip=True)
-                            if gate:
-                                row_data['駐機場'] = gate
-                        
+                            stand = stand_div.get_text(strip=True)
+                            if stand:
+                                row_data['駐機場'] = stand
+
                         # 状態（出発または到着）
-                        col6 = toggle_row.find('div', class_='col6')
-                        if col6:
+                        state_div = toggle_row.find('div', class_='state') or toggle_row.find('div', class_='col6')
+                        if state_div:
                             # hidden-textを除外
-                            for hidden in col6.find_all('i', class_='hidden-text'):
+                            for hidden in state_div.find_all('i', class_='hidden-text'):
                                 hidden.decompose()
-                            status = col6.get_text(strip=True)
+                            status = state_div.get_text(strip=True)
                             if status:
                                 row_data[status_key] = status
                         
@@ -528,7 +534,11 @@ class IncheonCargoScraper:
         
         if time_key_actual not in df.columns:
             df[time_key_actual] = None
-        
+        # v3.02: 駐機場・ターミナル列も常に存在させる（未割当日はキャッシュ上 null になる）
+        for key in ('ターミナル', '駐機場'):
+            if key not in df.columns:
+                df[key] = None
+
         print(f"\n✓ 取得したデータ: {len(df)} 件")
         
         # データを保存
@@ -903,6 +913,7 @@ class IncheonCargoScraper:
         - value: ICN → NGO → CVG
                  `🛫 ICN 11/08(日) 22:00 KST`
                  `🛬 NGO 11/08(日) 23:55 JST (推定)`
+                 `ICN Cargo(N) ・ 駐機場 675`
                  🟢 定刻どおり
         - hourly_check の差分情報（変更種別・前回予定時間・前回実際時間）があれば前回値も添える
         ----------------------------------------------------------------------
@@ -917,6 +928,7 @@ class IncheonCargoScraper:
         Notes:
             - author         Kidera-Shunsuke
             - revision       v3.00 (2026/11/08) - Changi 通知と共通の表形式に変更
+            - revision       v3.02 (2026/11/09) - ターミナル・駐機場の行を追加
         ----------------------------------------------------------------------
         """
         is_dep = (flight_type == 'departure')
@@ -988,7 +1000,15 @@ class IncheonCargoScraper:
             times = [f"`🛫 {icn_line}`", f"`🛬 {ngo_line}`"]
         else:
             times = [f"`🛫 {ngo_line}`", f"`🛬 {icn_line}`"]
-        value = "\n".join([route, *times, status])
+        # v3.02: ICN 側のターミナル・駐機場（駐機場は未割当なら '--'）
+        terminal = row.get('ターミナル', '')
+        stand = row.get('駐機場', '')
+        spot_parts = []
+        if self._is_str(terminal):
+            spot_parts.append(terminal.strip())
+        spot_parts.append(f"駐機場 {stand.strip() if self._is_str(stand) else '--'}")
+        spot_line = "`ICN " + " ・ ".join(spot_parts) + "`"
+        value = "\n".join([route, *times, spot_line, status])
         return {"name": name[:256], "value": value[:1024], "inline": False}
 
     # @function name:   _format_row
