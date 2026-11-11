@@ -4,8 +4,8 @@
 # @brief          仁川国際空港 貨物スケジュール 毎日定時通知システム
 # @author         Kidera Shunsuke
 # @date           2025/11/01
-# $Version:       1.02
-# $Revision:      2026/11/08
+# $Version:       1.03
+# $Revision:      2026/11/11
 # @note           毎日22時に7日分のデータ（出発便・到着便）を取得してDiscordに通知
 #                 キャッシュファイルのクリーンアップ機能を含む
 # @attention      プロジェクトのコーディングフォーマット・コメントフォーマット遵守
@@ -15,6 +15,7 @@
 #                 v1.00 (2025/11/01) - 初期実装・キャッシュ保存機能追加
 #                 v1.01 (2025/11/01) - 到着便データ取得・通知機能追加
 #                 v1.02 (2026/11/08) - コメントフォーマットの統一
+#                 v1.03 (2026/11/11) - 通知フォーマットを Changi 通知に完全準拠（出発便・到着便を 1 メッセージに統合）
 # Copyright (c) 2025-2026. All Rights reserved.
 #
 # -----------------------------------------------------------------------------------#
@@ -143,7 +144,7 @@ def main():
     関数概要：メイン処理
     - ログファイルのクリーンアップ（コメントアウト済み）
     - 7日分のデータ（出発便・到着便）を取得
-    - Discordに通知
+    - Discordに通知（Changi 通知と同じく出発便・到着便を 1 メッセージで送信）
     - キャッシュファイルを保存
     ----------------------------------------------------------------------
     Args:
@@ -155,6 +156,7 @@ def main():
     Notes:
         - author         Kidera-Shunsuke
         - revision       v1.01 (2025/11/01) - 到着便対応追加
+        - revision       v1.03 (2026/11/11) - 通知を Changi 通知と同一フォーマットに変更
     ----------------------------------------------------------------------
     """
     print("=" * 60)
@@ -233,34 +235,15 @@ def main():
     # スクレイパーのwebhook_urlを設定
     scraper.discord_webhook_url = webhook_url
     
-    success_departure = False
-    success_arrival = False
-    
-    # 出発便の通知
-    if has_departure:
-        print("\n【出発便の通知送信】")
-        success_departure = scraper.send_discord_notification(
-            df=df_departure,
-            start_date=start_date,
-            end_date=end_date,
-            airport='NGO',
-            flight_type='departure'
-        )
-    
-    # 到着便の通知
-    if has_arrival:
-        print("\n【到着便の通知送信】")
-        success_arrival = scraper.send_discord_notification(
-            df=df_arrival,
-            start_date=start_date,
-            end_date=end_date,
-            airport='NGO',
-            flight_type='arrival'
-        )
-    
-    # どちらか一方でも成功していればキャッシュを保存
-    success = success_departure or success_arrival
-    
+    # Changi 通知と同じく、出発便・到着便を 1 メッセージにまとめて送信
+    success = scraper.send_discord_notification(
+        df_departure=df_departure,
+        df_arrival=df_arrival,
+        start_date=start_date,
+        end_date=end_date,
+        airport='NGO'
+    )
+
     if success:
         # 通知成功後、キャッシュファイルを保存（出発便と到着便を分けて保存）
         if has_departure:

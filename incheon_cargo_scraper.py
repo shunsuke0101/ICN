@@ -4,8 +4,8 @@
 # @brief          仁川国際空港 貨物出発・到着スケジュール スクレイピングシステム
 # @author         Kidera Shunsuke
 # @date           2025/11/01
-# $Version:       3.02
-# $Revision:      2026/11/09
+# $Version:       3.03
+# $Revision:      2026/11/11
 # @note           仁川国際空港の貨物出発・到着スケジュールをWebスクレイピング
 #                 Discord Webhook通知機能を含む
 # @attention      プロジェクトのコーディングフォーマット・コメントフォーマット遵守
@@ -19,6 +19,8 @@
 #                 v3.00 (2026/11/08) - Discord 通知を Changi 通知と共通の表形式に変更
 #                 v3.01 (2026/11/08) - コメントフォーマットの統一
 #                 v3.02 (2026/11/09) - 駐機場をクラス名で取得（到着便の列ずれ修正）・通知に駐機場を表示
+#                 v3.03 (2026/11/11) - Discord 通知フォーマットを Changi 通知に完全準拠
+#                                      （出発便・到着便を 1 メッセージに統合・見出し／フッター文言・便間の空行）
 # Copyright (c) 2025-2026. All Rights reserved.
 #
 # -----------------------------------------------------------------------------------#
@@ -34,7 +36,7 @@
     - 出発便・到着便スケジュールの取得（API エンドポイント + フォールバック）
     - 複数日のデータ取得（並列）
     - CSV/JSON/Excel 形式でのエクスポート
-    - Discord Webhook 通知（Changi / 香港 / 上海 の通知と共通の表形式）
+    - Discord Webhook 通知（Changi / 香港 / 上海 の通知と共通のフォーマット）
 ========================================================================================
 """
 
@@ -44,7 +46,7 @@ from bs4 import BeautifulSoup                      # HTML パース
 import pandas as pd                                # 表データ処理
 
 # 標準ライブラリ
-from datetime import datetime, timedelta           # 日付・時刻処理
+from datetime import datetime, timedelta, timezone  # 日付・時刻処理
 import time                                        # 待機
 import json                                        # JSON 入出力
 from concurrent.futures import ThreadPoolExecutor  # 並列リクエスト
@@ -81,8 +83,9 @@ class IncheonCargoScraper:
 
     使用例:
         >>> scraper = IncheonCargoScraper()
-        >>> df = scraper.scrape_multiple_dates('20251101', '20251107', airport='NGO')
-        >>> scraper.send_discord_notification(df, '20251101', '20251107')
+        >>> df_dep = scraper.scrape_multiple_dates('20251101', '20251107', airport='NGO', flight_type='departure')
+        >>> df_arr = scraper.scrape_multiple_dates('20251101', '20251107', airport='NGO', flight_type='arrival')
+        >>> scraper.send_discord_notification(df_dep, df_arr, '20251101', '20251107')
     ========================================================================================
     """
     
@@ -678,6 +681,7 @@ class IncheonCargoScraper:
     FLIGHT_MIN_ICN_NGO = int(os.getenv('FLIGHT_MINUTES_ICN_NGO', '115'))  # ICN→NGO 所要時間（分）
     FLIGHT_MIN_NGO_ICN = int(os.getenv('FLIGHT_MINUTES_NGO_ICN', '125'))  # NGO→ICN 所要時間（分）
     WEEKDAY_JA = "月火水木金土日"                                          # 曜日表記（weekday() のインデックス順）
+    JST = timezone(timedelta(hours=9), 'JST')                              # 日本時間（韓国時間と同じ UTC+9。tzdata 不要の固定オフセット）
 
     # ======================================================================================#
     # @function name:   _color
@@ -929,6 +933,7 @@ class IncheonCargoScraper:
             - author         Kidera-Shunsuke
             - revision       v3.00 (2026/11/08) - Changi 通知と共通の表形式に変更
             - revision       v3.02 (2026/11/09) - ターミナル・駐機場の行を追加
+            - revision       v3.03 (2026/11/11) - 予定時刻が欠損している行でも前回値の比較で例外にならないよう修正
         ----------------------------------------------------------------------
         """
         is_dep = (flight_type == 'departure')
@@ -967,7 +972,8 @@ class IncheonCargoScraper:
         kind = {'新規': 'new', '時間変更': 'changed'}.get(change_type, '')
         prev_s = row.get('前回予定時間', '')
         prev_a = row.get('前回実際時間', '')
-        prev_sched = prev_s.strip() if self._is_str(prev_s) and prev_s.strip() != (sched_raw or '').strip() else None
+        sched_cmp = sched_raw.strip() if self._is_str(sched_raw) else ''
+        prev_sched = prev_s.strip() if self._is_str(prev_s) and prev_s.strip() != sched_cmp else None
         prev_status = None
         if kind == 'changed':
             prev_status = f"{tag} {prev_a.strip()}" if self._is_str(prev_a) else "定刻"
@@ -1182,9 +1188,10 @@ class IncheonCargoScraper:
         """
         ----------------------------------------------------------------------
         関数概要：便ごとの埋め込みフィールド一覧を組み立てる（日付・予定時刻順）
+        - 便と便の間に 1 行空ける（Changi 通知と同じ）
         ----------------------------------------------------------------------
         Args:
-            - df -> pd.DataFrame --- 便データ
+            - df -> pd.DataFrame | None --- 便データ（None・空は 0 件扱い）
             - flight_type -> str --- フライトタイプ ('departure' or 'arrival')
             - today -> date --- 基準日
         ----------------------------------------------------------------------
@@ -1194,14 +1201,20 @@ class IncheonCargoScraper:
         Notes:
             - author         Kidera-Shunsuke
             - revision       v3.00 (2026/11/08) - Changi 通知と共通の表形式に変更
+            - revision       v3.03 (2026/11/11) - 便間の空行を追加・空データに対応（Changi 通知に準拠）
         ----------------------------------------------------------------------
         """
+        if df is None or len(df) == 0:
+            return []
         sched_key = '出発時間（予定）' if flight_type == 'departure' else '到着時間（予定）'
-        fields, cur = [], None
+        fields = []
         if '取得日' in df.columns:
             df = df.sort_values(['取得日', sched_key], kind='stable') if sched_key in df.columns else df.sort_values('取得日')
         for _, row in df.iterrows():
             fields.append(self._format_row(row, flight_type, today))
+        # 便と便の間に 1 行空ける（最後の便には付けない）
+        for fld in fields[:-1]:
+            fld["value"] += "\n\u200b"
         return fields
 
     # @function name:   _build_fields
@@ -1226,40 +1239,96 @@ class IncheonCargoScraper:
         Notes:
             - author         Kidera-Shunsuke
             - revision       v3.00 (2026/11/08) - Changi 通知と共通の表形式に変更
+            - revision       v3.03 (2026/11/11) - 便間の空行（ゼロ幅スペース）を除いて表示
         ----------------------------------------------------------------------
         """
         if not fields:
             return "  該当便なし"
-        out = []
-        for f in fields:
-            if f["value"] == "\u200b":
-                out.append(f" {f['name']}")
-            else:
-                out.append(f"  {f['name']}\n" + "\n".join("    " + l for l in f["value"].splitlines()))
-        return "\n".join(out)
+        return "\n".join(f"  {f['name']}\n" + "\n".join("    " + l for l in f["value"].replace("\u200b", "").splitlines()) for f in fields)
 
     # @function name:   _fields_to_text
     # @function end
     # ======================================================================================#
 
     # ======================================================================================#
-    # @function name:   send_discord_notification
+    # @function name:   _embeds
     # @function start
-    def send_discord_notification(self, df, start_date, end_date, airport='NGO', flight_type='departure'):
+    @staticmethod
+    def _embeds(title, fields, color):
         """
         ----------------------------------------------------------------------
-        関数概要：Discordに通知を送信（Changi 通知と共通の表形式）
-        - 出発便 = 青 / 到着便 = 緑 の embed、1 便 1 行の等幅テーブル
-        - 列: 出発地 出発時刻 | 便名 | 到着地 到着時刻 | 状態
-        - 名古屋側の時刻は標準所要時間からの推定（* 付き）
-        - 4000 字ごとに embed を分割、10 embeds/message で送信
+        関数概要：フィールド一覧を Discord 埋め込みに分割して組み立てる
+        - 1 埋め込みあたり 25 フィールド上限のため 24 件ずつ分割
         ----------------------------------------------------------------------
         Args:
-            - df -> pd.DataFrame --- 送信するデータ
+            - title -> str --- 埋め込みタイトル
+            - fields -> list[dict] --- 埋め込みフィールド一覧
+            - color -> int --- 埋め込みの色
+        ----------------------------------------------------------------------
+        Returns:
+            - embeds -> list[dict] --- 埋め込みリスト（0 件の場合は '該当便なし' の 1 件）
+        ----------------------------------------------------------------------
+        Notes:
+            - author         Kidera-Shunsuke
+            - revision       v3.03 (2026/11/11) - 新規作成（Changi 通知に準拠）
+        ----------------------------------------------------------------------
+        """
+        if not fields:
+            return [{"title": title, "description": "該当便なし", "color": color}]
+        return [{"title": title if i == 0 else f"{title} (続き)", "color": color, "fields": fields[i:i + 24]}
+                for i in range(0, len(fields), 24)]  # 25 fields/embed 上限
+
+    # @function name:   _embeds
+    # @function end
+    # ======================================================================================#
+
+    # ======================================================================================#
+    # @function name:   _count_changes
+    # @function start
+    @classmethod
+    def _count_changes(cls, df):
+        """
+        ----------------------------------------------------------------------
+        関数概要：前回通知から変化した便（変更種別 = 新規 / 時間変更）の件数を数える
+        ----------------------------------------------------------------------
+        Args:
+            - df -> pd.DataFrame | None --- 便データ（'変更種別' 列が無ければ 0 件）
+        ----------------------------------------------------------------------
+        Returns:
+            - count -> int --- 変化件数
+        ----------------------------------------------------------------------
+        Notes:
+            - author         Kidera-Shunsuke
+            - revision       v3.03 (2026/11/11) - 新規作成（Changi 通知に準拠）
+        ----------------------------------------------------------------------
+        """
+        if df is None or len(df) == 0 or '変更種別' not in df.columns:
+            return 0
+        return sum(1 for v in df['変更種別'] if cls._is_str(v) and v.strip() in ('新規', '時間変更'))
+
+    # @function name:   _count_changes
+    # @function end
+    # ======================================================================================#
+
+    # ======================================================================================#
+    # @function name:   send_discord_notification
+    # @function start
+    def send_discord_notification(self, df_departure, df_arrival, start_date, end_date, airport='NGO'):
+        """
+        ----------------------------------------------------------------------
+        関数概要：Discordに通知を送信（Changi 通知と同一フォーマット）
+        - 出発便（青）・到着便（緑）の埋め込みを 1 メッセージにまとめて送信
+        - 1 便 = 埋め込みフィールド 1 枠。'変更種別' 列がある行は 🆕 / 🔔 を付けて前回値を添える
+        - 見出し: ICN ⇄ NGO カーゴ便  |  出発 N 件 / 到着 M 件  ・ 変化 K 件
+        - 名古屋側の時刻は標準所要時間からの推定
+        - 24 フィールドごとに埋め込みを分割、10 embeds/message で送信
+        ----------------------------------------------------------------------
+        Args:
+            - df_departure -> pd.DataFrame | None --- 出発便データ（None・空は「該当便なし」）
+            - df_arrival -> pd.DataFrame | None --- 到着便データ（None・空は「該当便なし」）
             - start_date -> str --- 開始日 (YYYYMMDD)
             - end_date -> str --- 終了日 (YYYYMMDD)
             - airport -> str --- 空港コード (デフォルト: NGO)
-            - flight_type -> str --- フライトタイプ ('departure' or 'arrival')
         ----------------------------------------------------------------------
         Returns:
             - success -> bool --- 全バッチ送信成功時True
@@ -1267,6 +1336,8 @@ class IncheonCargoScraper:
         Notes:
             - author         Kidera-Shunsuke
             - revision       v3.00 (2026/11/08) - Changi 通知と共通の表形式に変更
+            - revision       v3.03 (2026/11/11) - 出発便・到着便を 1 メッセージに統合し Changi 通知に完全準拠
+                                                  （引数を df, flight_type → df_departure, df_arrival に変更）
         ----------------------------------------------------------------------
         """
         if not self.discord_webhook_url:
@@ -1274,30 +1345,37 @@ class IncheonCargoScraper:
             print("環境変数 DISCORD_WEBHOOK_URL を設定するか、初期化時に指定してください")
             return False
 
-        if df is None or len(df) == 0:
+        n_dep = 0 if df_departure is None else len(df_departure)
+        n_arr = 0 if df_arrival is None else len(df_arrival)
+        if n_dep == 0 and n_arr == 0:
             print("送信するデータがありません")
             return False
 
         try:
-            is_dep = (flight_type == 'departure')
-            today = datetime.now().date()
-            has_change_type = '変更種別' in df.columns
-            color = self._color('DISCORD_COLOR_DEP', 0x3B82F6) if is_dep else self._color('DISCORD_COLOR_ARR', 0x22C55E)
-            route = f"ICN → {airport}" if is_dep else f"{airport} → ICN"
-            kind = "出発便" if is_dep else "到着便"
-            what = "変更" if has_change_type else ""
-            title = f"{kind}  {route}  ({len(df)} 件{what})"
+            now = datetime.now(self.JST)
+            today = now.date()
+            dep_fields = self._build_fields(df_departure, 'departure', today)
+            arr_fields = self._build_fields(df_arrival, 'arrival', today)
+            n_changed = self._count_changes(df_departure) + self._count_changes(df_arrival)
             period = f"{self._day_label(start_date, today)} 〜 {self._day_label(end_date, today)}"
+            title = f"ICN ⇄ {airport} カーゴ便  |  出発 {n_dep} 件 / 到着 {n_arr} 件"
 
-            fields = self._build_fields(df, flight_type, today)
-            print(self._fields_to_text(fields))
-            embeds = [{"title": title if i == 0 else f"{title} （続き）", "color": color, "fields": fields[i:i + 24]}
-                      for i in range(0, len(fields), 24)] or [{"title": title, "description": "該当便なし", "color": color}]
+            # 標準出力表示
+            print(title, f"(変化 {n_changed} 件)" if n_changed else "")
+            print(f"対象期間: {period}")
+            print(f"[出発便  ICN → {airport}]")
+            print(self._fields_to_text(dep_fields))
+            print(f"[到着便  {airport} → ICN]")
+            print(self._fields_to_text(arr_fields))
+
+            # 埋め込み組み立て（出発 = 青 / 到着 = 緑、フッターは最後の埋め込みに付ける）
+            embeds = self._embeds(f"出発便  ICN → {airport}  ({n_dep} 件)", dep_fields, self._color('DISCORD_COLOR_DEP', 0x3B82F6)) + \
+                     self._embeds(f"到着便  {airport} → ICN  ({n_arr} 件)", arr_fields, self._color('DISCORD_COLOR_ARR', 0x22C55E))
             embeds[-1]["footer"] = {
-                "text": f"KST=韓国時間 / JST=日本時間（同じ UTC+9） ・ 推定=標準所要時間からの概算 ・ 🔔=前回通知から変化 ・ 更新 {datetime.now():%m/%d %H:%M} JST"
+                "text": f"KST=韓国時間 / JST=日本時間 ・ 日付は各空港の現地日付 ・ 推定=標準所要時間からの概算 ・ 🔔=前回通知から変化 ・ 更新 {now:%m/%d %H:%M} JST"
             }
-            content = (f"**ICN ⇄ {airport} カーゴ便{'（変更あり）' if has_change_type else ''}  |  {kind} {len(df)} 件**\n"
-                       f"対象期間: {period}")
+            chg = f"  ・ 変化 {n_changed} 件" if n_changed else ""
+            content = f"**{title}**{chg}\n対象期間: {period}"
 
             MAX_EMBEDS_PER_MSG = 10
             print(f"  Webhook URL: {self.discord_webhook_url[:50]}...")

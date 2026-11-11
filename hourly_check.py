@@ -4,20 +4,24 @@
 # @brief          仁川国際空港 貨物スケジュール 時間ごと変更検知システム
 # @author         Kidera Shunsuke
 # @date           2025/11/01
-# $Version:       1.06
-# $Revision:      2026/11/08
+# $Version:       1.07
+# $Revision:      2026/11/11
 # @note           1時間ごとに実行し、前回データとの差分を検出してDiscord通知
 #                 出発便・到着便それぞれ独立して変更を検出
 #                 変更がない場合は通知をスキップすることで無駄な通知を削減
 #                 
-#                 【通知対象】
+#                 【通知フォーマット】（Changi 通知と同一）
+#                 - 変更を検出したときだけ、出発便・到着便を 1 メッセージにまとめて通知
+#                 - 対象期間の全便を載せ、変化した便に 🆕（新規）/ 🔔（時間変更）と前回値を付ける
+#                 
+#                 【変化として扱うもの】
 #                 - 🆕 新規: 完全に新しい便名のみ（同じ便名の別日追加は除外）
-#                 - ⏰ 時間変更: 予定時間または実際の時間の変更
+#                 - 🔔 時間変更: 予定時間または実際の時間の変更
 #                   - 予定時間のみ変更
 #                   - 実際の時間のみ変更（未定 → 登録を含む）
 #                   - 両方変更
 #                 
-#                 【通知対象外】
+#                 【変化として扱わないもの】
 #                 - 🗑️ 削除: 便名の削除は通知しない（ノイズ削減）
 #                 - 同じ便名の別日追加（スケジュール更新による自然な追加）
 # @attention      プロジェクトのコーディングフォーマット・コメントフォーマット遵守
@@ -31,6 +35,8 @@
 #                 v1.04 (2025/11/06) - 実際の時間変更検出強化（予定時間不問）
 #                 v1.05 (2025/11/08) - 実際の時間変更検出修正（便名・日付のみで照合）
 #                 v1.06 (2026/11/08) - コメントフォーマットの統一
+#                 v1.07 (2026/11/11) - 通知フォーマットを Changi 通知に完全準拠
+#                                      （出発便・到着便を 1 メッセージに統合、全便を載せて変化した便に印を付ける）
 # Copyright (c) 2025-2026. All Rights reserved.
 #
 # -----------------------------------------------------------------------------------#
@@ -311,6 +317,38 @@ def compare_data(previous, current):
 
 
 # ======================================================================================#
+# @function name:   annotate_changes
+# @function start
+def annotate_changes(current, changed_items):
+    """
+    ----------------------------------------------------------------------
+    関数概要：全便データに変更情報（変更種別・前回値）を重ねた通知用データを作る
+    - Changi 通知と同じく「全便を載せ、変化した便に 🆕 / 🔔 を付ける」ための前処理
+    - 便名・取得日が一致する行を compare_data の変更データ（変更種別付き）に差し替える
+    - 元の current は変更しない（キャッシュ保存用にそのまま使えるようにする）
+    ----------------------------------------------------------------------
+    Args:
+        - current -> list --- 現在取得したデータ（全便）
+        - changed_items -> list --- compare_data が返した変更データ
+    ----------------------------------------------------------------------
+    Returns:
+        - rows -> list --- 通知用データ（全便。変化した便のみ変更種別・前回値付き）
+    ----------------------------------------------------------------------
+    Notes:
+        - author         Kidera-Shunsuke
+        - revision       v1.07 (2026/11/11) - 新規作成（Changi 通知に準拠）
+    ----------------------------------------------------------------------
+    """
+    def key_of(item):
+        return (normalize_value(item.get('便名')), normalize_value(item.get('取得日')))
+
+    changed = {key_of(item): item for item in changed_items or [] if item.get('変更種別')}
+    return [changed.get(key_of(item), item) for item in current]
+
+
+# @function name:   annotate_changes
+# @function end
+# ======================================================================================#
 
 
 # ======================================================================================#
@@ -322,7 +360,7 @@ def main():
     関数概要：メイン処理 - 1時間ごとのチェック
     - 7日分のデータ（出発便・到着便）を取得
     - 前回データと比較
-    - 変更があった場合のみDiscordに通知
+    - 変更があった場合のみDiscordに通知（出発便・到着便を 1 メッセージ、変化した便に印）
     ----------------------------------------------------------------------
     Args:
         - なし
@@ -333,6 +371,7 @@ def main():
     Notes:
         - author         Kidera-Shunsuke
         - revision       v1.01 (2025/11/01) - 到着便対応追加
+        - revision       v1.07 (2026/11/11) - 通知を Changi 通知と同一フォーマットに変更
     ----------------------------------------------------------------------
     """
     
@@ -429,31 +468,15 @@ def main():
     if has_changes_overall:
         print("\n変更が検出されました。Discordに通知を送信します...")
         
-        success_departure = False
-        success_arrival = False
-        
-        # 出発便の通知（変更データのみ）
-        if has_departure_data and has_changes_dep and changed_data_departure:
-            print(f"\n【出発便の通知送信】変更データ: {len(changed_data_departure)}件")
-            # 変更データのみをDataFrameに変換
-            import pandas as pd
-            df_departure_changed = pd.DataFrame(changed_data_departure)
-            success_departure = scraper.send_discord_notification(
-                df_departure_changed, start_date, end_date, 'NGO', flight_type='departure'
-            )
-        
-        # 到着便の通知（変更データのみ）
-        if has_arrival_data and has_changes_arr and changed_data_arrival:
-            print(f"\n【到着便の通知送信】変更データ: {len(changed_data_arrival)}件")
-            # 変更データのみをDataFrameに変換
-            import pandas as pd
-            df_arrival_changed = pd.DataFrame(changed_data_arrival)
-            success_arrival = scraper.send_discord_notification(
-                df_arrival_changed, start_date, end_date, 'NGO', flight_type='arrival'
-            )
-        
-        success = success_departure or success_arrival
-        
+        # Changi 通知と同じく、出発便・到着便を 1 メッセージにまとめ、
+        # 全便を載せたうえで変化した便に 🆕 / 🔔 を付ける
+        print(f"\n【通知送信】変更データ: 出発便 {len(changed_data_departure)}件 / 到着便 {len(changed_data_arrival)}件")
+        df_departure_notify = pd.DataFrame(annotate_changes(current_data_departure, changed_data_departure)) if has_departure_data else pd.DataFrame()
+        df_arrival_notify = pd.DataFrame(annotate_changes(current_data_arrival, changed_data_arrival)) if has_arrival_data else pd.DataFrame()
+        success = scraper.send_discord_notification(
+            df_departure_notify, df_arrival_notify, start_date, end_date, 'NGO'
+        )
+
         if success:
             # 成功したら現在のデータを保存
             if has_departure_data:
