@@ -4,28 +4,26 @@
 # @brief          仁川国際空港 貨物スケジュール 毎日定時通知システム
 # @author         Kidera Shunsuke
 # @date           2025/11/01
-# $Version:       1.03
-# $Revision:      2026/11/11
+# $Version:       1.04
+# $Revision:      2026/11/12
 # @note           毎日22時に7日分のデータ（出発便・到着便）を取得してDiscordに通知
 #                 キャッシュファイルのクリーンアップ機能を含む
 # @attention      プロジェクトのコーディングフォーマット・コメントフォーマット遵守
 #                 Windows Task Schedulerで毎日22:00に実行される想定
-#                 出発便・到着便それぞれ別のキャッシュファイルに保存
+#                 変更検出用のキャッシュ（log/last_data_cache*.json）は hourly_check.py だけが管理する
+#                 （ここで上書きすると、直前に起きた変更が個別通知されないまま消えてしまうため）
 # @par            History
 #                 v1.00 (2025/11/01) - 初期実装・キャッシュ保存機能追加
 #                 v1.01 (2025/11/01) - 到着便データ取得・通知機能追加
 #                 v1.02 (2026/11/08) - コメントフォーマットの統一
 #                 v1.03 (2026/11/11) - 通知フォーマットを Changi 通知に完全準拠（出発便・到着便を 1 メッセージに統合）
+#                 v1.04 (2026/11/12) - キャッシュ保存を廃止（変更検出用キャッシュは hourly_check.py に一本化）
 # Copyright (c) 2025-2026. All Rights reserved.
 #
 # -----------------------------------------------------------------------------------#
 
 # 標準ライブラリ
 import os                                          # 環境変数・ファイル操作
-import shutil                                      # ファイル操作
-import json                                        # JSON 入出力
-import math                                        # NaN 判定
-from pathlib import Path                           # パス操作
 from datetime import datetime, timedelta           # 日付・時刻処理
 
 # スクレイピングモジュール
@@ -33,58 +31,6 @@ from incheon_cargo_scraper import IncheonCargoScraper  # 仁川空港 貨物便�
 
 # 外部ライブラリ
 from dotenv import load_dotenv                     # .env 読み込み
-
-
-# ======================================================================================#
-# @function name:   save_cache_data
-# @function start
-def save_cache_data(df, log_dir='log'):
-    """
-    ----------------------------------------------------------------------
-    関数概要：取得したデータをキャッシュファイルに保存
-    - DataFrameをJSON形式で保存
-    - NaN値をNoneに変換してJSON互換性を確保
-    ----------------------------------------------------------------------
-    Args:
-        - df -> pd.DataFrame --- 保存するDataFrame
-        - log_dir -> str --- ログディレクトリパス（デフォルト: 'log'）
-    ----------------------------------------------------------------------
-    Returns:
-        - なし
-    ----------------------------------------------------------------------
-    Notes:
-        - author         Kidera-Shunsuke
-        - revision       v1.01 (2025/11/01) - 到着便対応追加
-    ----------------------------------------------------------------------
-    """
-    cache_file = Path(log_dir) / 'last_data_cache.json'
-    
-    try:
-        # DataFrameを辞書のリストに変換し、NaN値をNoneに変換
-        data = df.to_dict('records')
-        cleaned_data = []
-        
-        for item in data:
-            cleaned_item = {}
-            for key, value in item.items():
-                if isinstance(value, float) and math.isnan(value):
-                    cleaned_item[key] = None
-                else:
-                    cleaned_item[key] = value
-            cleaned_data.append(cleaned_item)
-        
-        # JSONファイルに保存
-        with open(cache_file, 'w', encoding='utf-8') as f:
-            json.dump(cleaned_data, f, ensure_ascii=False, indent=2)
-        
-        print(f"  キャッシュファイルを保存: {cache_file}")
-    except Exception as e:
-        print(f"  警告: キャッシュファイルの保存に失敗 - {e}")
-
-
-# @function name:   save_cache_data
-# @function end
-# ======================================================================================#
 
 
 # ======================================================================================#
@@ -145,7 +91,6 @@ def main():
     - ログファイルのクリーンアップ（コメントアウト済み）
     - 7日分のデータ（出発便・到着便）を取得
     - Discordに通知（Changi 通知と同じく出発便・到着便を 1 メッセージで送信）
-    - キャッシュファイルを保存
     ----------------------------------------------------------------------
     Args:
         - なし
@@ -157,6 +102,7 @@ def main():
         - author         Kidera-Shunsuke
         - revision       v1.01 (2025/11/01) - 到着便対応追加
         - revision       v1.03 (2026/11/11) - 通知を Changi 通知と同一フォーマットに変更
+        - revision       v1.04 (2026/11/12) - キャッシュ保存を廃止
     ----------------------------------------------------------------------
     """
     print("=" * 60)
@@ -245,30 +191,6 @@ def main():
     )
 
     if success:
-        # 通知成功後、キャッシュファイルを保存（出発便と到着便を分けて保存）
-        if has_departure:
-            save_cache_data(df_departure, log_dir='log')
-        if has_arrival:
-            # 到着便用のキャッシュファイルを別名で保存
-            import pandas as pd
-            cache_file = Path('log') / 'last_data_cache_arrival.json'
-            try:
-                data = df_arrival.to_dict('records')
-                cleaned_data = []
-                for item in data:
-                    cleaned_item = {}
-                    for key, value in item.items():
-                        if isinstance(value, float) and math.isnan(value):
-                            cleaned_item[key] = None
-                        else:
-                            cleaned_item[key] = value
-                    cleaned_data.append(cleaned_item)
-                with open(cache_file, 'w', encoding='utf-8') as f:
-                    json.dump(cleaned_data, f, ensure_ascii=False, indent=2)
-                print(f"  到着便キャッシュファイルを保存: {cache_file}")
-            except Exception as e:
-                print(f"  警告: 到着便キャッシュファイルの保存に失敗 - {e}")
-        
         print()
         print("=" * 60)
         print("✓ 通知の送信が完了しました")

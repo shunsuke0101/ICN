@@ -4,29 +4,33 @@
 # @brief          仁川国際空港 貨物スケジュール 時間ごと変更検知システム
 # @author         Kidera Shunsuke
 # @date           2025/11/01
-# $Version:       1.07
-# $Revision:      2026/11/11
+# $Version:       2.00
+# $Revision:      2026/11/12
 # @note           1時間ごとに実行し、前回データとの差分を検出してDiscord通知
 #                 出発便・到着便それぞれ独立して変更を検出
 #                 変更がない場合は通知をスキップすることで無駄な通知を削減
-#                 
-#                 【通知フォーマット】（Changi 通知と同一）
-#                 - 変更を検出したときだけ、出発便・到着便を 1 メッセージにまとめて通知
-#                 - 対象期間の全便を載せ、変化した便に 🆕（新規）/ 🔔（時間変更）と前回値を付ける
-#                 
-#                 【変化として扱うもの】
-#                 - 🆕 新規: 完全に新しい便名のみ（同じ便名の別日追加は除外）
-#                 - 🔔 時間変更: 予定時間または実際の時間の変更
-#                   - 予定時間のみ変更
-#                   - 実際の時間のみ変更（未定 → 登録を含む）
-#                   - 両方変更
-#                 
-#                 【変化として扱わないもの】
-#                 - 🗑️ 削除: 便名の削除は通知しない（ノイズ削減）
-#                 - 同じ便名の別日追加（スケジュール更新による自然な追加）
+#
+#                 【通知フォーマット】
+#                 - 変更があった便だけを、1 便 = 1 メッセージで個別に通知する
+#                 - 各メッセージ: 本文に便名・経路・日付と変更内容の要約、
+#                   埋め込みに一覧通知と同じ 1 便分の枠（+ 前回の状態）
+#                 - 初回実行（キャッシュなし）のときだけ、対象期間の全便を一覧で 1 回通知する
+#
+#                 【変更として扱うもの】（便名 + 日付で照合）
+#                 - 🔔 時刻・状態の変更: 予定時刻 / 最新時刻（見込み・実績）/ 状態（遅延・出発・到着・欠航）
+#                 - 🆕 追加: 前回すでに監視していた日付に、新しい便が現れた
+#                 - 🗑️ 削除: 監視中の日付から便が消えた（.env の ICN_NOTIFY_REMOVED=0 で通知しない）
+#                 - 🔔 日付変更: 同じ便名で「削除」と「追加」が前後 1 日以内に同時に起きた場合は 1 件にまとめる
+#
+#                 【変更として扱わないもの】
+#                 - 監視期間が 1 日進んだことで新しく見えるようになった便 / 期間外に出た便
+#                 - 取得に失敗した日付の便（前回データを持ち越し、次回あらためて比較する）
+#                 - 駐機場・ターミナルの割当
+#                 - すでに出発/到着済み・欠航の便がサイトから消えた場合
 # @attention      プロジェクトのコーディングフォーマット・コメントフォーマット遵守
 #                 Windows Task Schedulerで1時間ごとに実行される想定
 #                 last_data_cache.jsonとlast_data_cache_arrival.jsonに前回データを保存
+#                 （キャッシュの読み書きはこのスクリプトだけが行う。daily_notify.py は触らない）
 # @par            History
 #                 v1.00 (2025/11/01) - 初期実装・NaN値正規化対応
 #                 v1.01 (2025/11/01) - 到着便データ取得・変更検出機能追加
@@ -37,6 +41,13 @@
 #                 v1.06 (2026/11/08) - コメントフォーマットの統一
 #                 v1.07 (2026/11/11) - 通知フォーマットを Changi 通知に完全準拠
 #                                      （出発便・到着便を 1 メッセージに統合、全便を載せて変化した便に印を付ける）
+#                 v2.00 (2026/11/12) - 全面改修
+#                                      ・変更があった便を 1 便 = 1 メッセージで個別通知
+#                                      ・変更判定を「予定時刻・最新時刻・状態」の比較に変更（状態だけの変化も検出）
+#                                      ・追加 / 削除 / 日付変更の検出（監視期間のずれ・取得失敗では誤検出しない）
+#                                      ・監視期間を「前日〜6 日後」に拡大（日付をまたいだ出発・到着を拾う）
+#                                      ・通知に失敗した便は前回データを残し、次回もう一度通知する
+#                                      ・キャッシュ形式を変更（監視済みの日付を一緒に保存。旧形式も読み込み可）
 # Copyright (c) 2025-2026. All Rights reserved.
 #
 # -----------------------------------------------------------------------------------#
@@ -49,11 +60,11 @@ from datetime import datetime, timedelta           # 日付・時刻処理
 import sys                                         # 終了コード
 import os                                          # 環境変数アクセス
 import json                                        # JSON 入出力
+import math                                        # NaN 判定
 from pathlib import Path                           # パス操作
 
 # 外部ライブラリ
 from dotenv import load_dotenv                     # .env 読み込み
-import pandas as pd                                # 表データ処理
 
 # .envファイルを読み込む
 load_dotenv()
@@ -71,123 +82,217 @@ if not LOG_DIR.exists():
 CACHE_FILE = LOG_DIR / 'last_data_cache.json'                   # 出発便キャッシュ
 CACHE_FILE_ARRIVAL = LOG_DIR / 'last_data_cache_arrival.json'   # 到着便キャッシュ
 
+# ======================================================================================#
+# 監視設定
+# ======================================================================================#
+LOOKBACK_DAYS = 1                                  # 何日前から監視するか（日付をまたいだ出発・到着を拾うため前日を含める）
+LOOKAHEAD_DAYS = 6                                 # 何日後まで監視するか
+MOVE_MAX_DAYS = 1                                  # 「削除 + 追加」を日付変更とみなす日付差の上限（日）
+NOTIFY_REMOVED = os.getenv('ICN_NOTIFY_REMOVED', '1').strip().lower() not in ('0', 'false', 'no', 'off')  # 削除を通知するか
+
+# 対象（フライトタイプ, 表示名, キャッシュファイル）
+DIRECTIONS = [
+    ('departure', '出発便', CACHE_FILE),
+    ('arrival', '到着便', CACHE_FILE_ARRIVAL),
+]
+
 
 # ======================================================================================#
-# @function name:   load_previous_data
+# @function name:   clean_records
 # @function start
-def load_previous_data():
+def clean_records(records):
     """
     ----------------------------------------------------------------------
-    関数概要：前回取得したデータを読み込む
-    - キャッシュファイル(last_data_cache.json)から前回のデータを取得
-    - ファイルが存在しない場合や読み込み失敗時はNoneを返す
+    関数概要：データ行の NaN を None に変換する
+    - JSON 保存・比較のため、欠損値の表現を None に統一
     ----------------------------------------------------------------------
     Args:
-        - なし
+        - records -> list[dict] --- データ行のリスト（DataFrame.to_dict('records') の結果）
     ----------------------------------------------------------------------
     Returns:
-        - data -> list | None --- 前回取得したデータ（辞書のリスト）、失敗時はNone
+        - cleaned -> list[dict] --- NaN を None に置き換えたデータ行のリスト
     ----------------------------------------------------------------------
     Notes:
         - author         Kidera-Shunsuke
-        - revision       v1.00 (2025/11/01) - 初期実装
+        - revision       v2.00 (2026/11/12) - 新規作成（保存処理に埋め込まれていた変換を共通化）
     ----------------------------------------------------------------------
     """
-    if CACHE_FILE.exists():
-        try:
-            with open(CACHE_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except Exception as e:
-            print(f"警告: キャッシュファイルの読み込みに失敗 - {e}")
-            return None
-    return None
+    return [
+        {key: (None if isinstance(value, float) and math.isnan(value) else value) for key, value in item.items()}
+        for item in records
+    ]
 
 
-# @function name:   load_previous_data
+# @function name:   clean_records
 # @function end
 # ======================================================================================#
 
 
 # ======================================================================================#
-# @function name:   save_current_data
+# @function name:   date_range
 # @function start
-def save_current_data(data):
+def date_range(start_date, end_date):
     """
     ----------------------------------------------------------------------
-    関数概要：現在のデータをキャッシュファイルに保存
-    - NaN値をNoneに変換してJSON互換性を確保
-    - 次回の比較用にデータを永続化
+    関数概要：開始日〜終了日の日付文字列（YYYYMMDD）を列挙する
     ----------------------------------------------------------------------
     Args:
-        - data -> list --- 保存するデータ（辞書のリスト）
+        - start_date -> str --- 開始日 (YYYYMMDD)
+        - end_date -> str --- 終了日 (YYYYMMDD)
     ----------------------------------------------------------------------
     Returns:
-        - なし
+        - dates -> list[str] --- 日付文字列のリスト（変換不能時は空リスト）
     ----------------------------------------------------------------------
     Notes:
         - author         Kidera-Shunsuke
-        - revision       v1.00 (2025/11/01) - 初期実装
+        - revision       v2.00 (2026/11/12) - 新規作成
     ----------------------------------------------------------------------
     """
     try:
-        # NaN値をNoneに変換
-        cleaned_data = []
-        for item in data:
-            cleaned_item = {}
-            for key, value in item.items():
-                if isinstance(value, float):
-                    import math
-                    if math.isnan(value):
-                        cleaned_item[key] = None
-                    else:
-                        cleaned_item[key] = value
-                else:
-                    cleaned_item[key] = value
-            cleaned_data.append(cleaned_item)
-        
-        with open(CACHE_FILE, 'w', encoding='utf-8') as f:
-            json.dump(cleaned_data, f, ensure_ascii=False, indent=2)
-        print(f"  データをキャッシュに保存: {CACHE_FILE}")
-    except Exception as e:
-        print(f"警告: キャッシュファイルの保存に失敗 - {e}")
+        current = datetime.strptime(str(start_date)[:8], '%Y%m%d')
+        end = datetime.strptime(str(end_date)[:8], '%Y%m%d')
+    except ValueError:
+        return []
+    dates = []
+    while current <= end:
+        dates.append(current.strftime('%Y%m%d'))
+        current += timedelta(days=1)
+    return dates
 
 
-# @function name:   save_current_data
+# @function name:   date_range
 # @function end
 # ======================================================================================#
 
 
 # ======================================================================================#
-# @function name:   normalize_value
+# @function name:   load_cache
 # @function start
-def normalize_value(value):
+def load_cache(cache_file):
     """
     ----------------------------------------------------------------------
-    関数概要：値を正規化する
-    - NaN、None、空文字列、文字列"NaN"をすべてNoneに統一
-    - データ比較時の誤判定を防ぐ
+    関数概要：前回取得したデータをキャッシュファイルから読み込む
+    - 新形式: {"version": 2, "covered_dates": [...], "flights": [...]}
+    - 旧形式（便データのリストのみ）も読み込める。監視済みの日付は
+      便データの最小日〜最大日として扱う
     ----------------------------------------------------------------------
     Args:
-        - value --- 正規化する値
+        - cache_file -> Path --- キャッシュファイルのパス
     ----------------------------------------------------------------------
     Returns:
-        正規化された値（NaN系の値はNone、それ以外はそのまま）
+        - cache -> dict | None --- {'flights': list[dict], 'covered_dates': set[str]}
+                                   （ファイルが無い・読み込み失敗時は None）
     ----------------------------------------------------------------------
     Notes:
         - author         Kidera-Shunsuke
-        - revision       v1.00 (2025/11/01) - 初期実装
+        - revision       v1.00 (2025/11/01) - 初期実装（load_previous_data）
+        - revision       v2.00 (2026/11/12) - 出発便・到着便で共通化、監視済みの日付を扱う新形式に対応
     ----------------------------------------------------------------------
     """
-    import math
-    # 文字列"NaN"もNoneに変換
-    if value is None or value == '' or value == 'NaN':
+    if not cache_file.exists():
         return None
-    if isinstance(value, float) and math.isnan(value):
+    try:
+        with open(cache_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"警告: キャッシュファイルの読み込みに失敗 - {e}")
         return None
-    return value
+
+    if isinstance(data, dict) and isinstance(data.get('flights'), list):
+        return {'flights': data['flights'], 'covered_dates': set(data.get('covered_dates') or [])}
+    if isinstance(data, list):
+        # 旧形式: 便がある日の最小〜最大を監視済みとみなす
+        days = sorted(str(item.get('取得日')) for item in data if isinstance(item, dict) and item.get('取得日'))
+        covered = set(date_range(days[0], days[-1])) if days else set()
+        return {'flights': [item for item in data if isinstance(item, dict)], 'covered_dates': covered}
+    print(f"警告: キャッシュファイルの形式が不正です - {cache_file}")
+    return None
 
 
-# @function name:   normalize_value
+# @function name:   load_cache
+# @function end
+# ======================================================================================#
+
+
+# ======================================================================================#
+# @function name:   save_cache
+# @function start
+def save_cache(cache_file, flights, covered_dates):
+    """
+    ----------------------------------------------------------------------
+    関数概要：今回のデータをキャッシュファイルに保存（次回の比較用）
+    ----------------------------------------------------------------------
+    Args:
+        - cache_file -> Path --- キャッシュファイルのパス
+        - flights -> list[dict] --- 保存する便データ
+        - covered_dates -> set[str] --- 監視済みの日付（YYYYMMDD）
+    ----------------------------------------------------------------------
+    Returns:
+        - success -> bool --- 保存成功時 True
+    ----------------------------------------------------------------------
+    Notes:
+        - author         Kidera-Shunsuke
+        - revision       v1.00 (2025/11/01) - 初期実装（save_current_data）
+        - revision       v2.00 (2026/11/12) - 出発便・到着便で共通化、監視済みの日付を一緒に保存
+    ----------------------------------------------------------------------
+    """
+    data = {
+        'version': 2,
+        'saved_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'covered_dates': sorted(covered_dates),
+        'flights': clean_records(flights),
+    }
+    try:
+        # 書き込み途中で止まっても前回データを壊さないよう、一時ファイルに書いてから置き換える
+        tmp_file = cache_file.with_name(cache_file.name + '.tmp')
+        with open(tmp_file, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_file, cache_file)
+        print(f"  データをキャッシュに保存: {cache_file}")
+        return True
+    except Exception as e:
+        print(f"警告: キャッシュファイルの保存に失敗 - {e}")
+        return False
+
+
+# @function name:   save_cache
+# @function end
+# ======================================================================================#
+
+
+# ======================================================================================#
+# @function name:   index_flights
+# @function start
+def index_flights(flights, flight_type):
+    """
+    ----------------------------------------------------------------------
+    関数概要：便データを照合キー（便名, 日付, 連番）で引ける辞書にする
+    - 連番は同じ日に同じ便名が複数ある場合の区別用（予定時刻順に 0, 1, ...）
+    ----------------------------------------------------------------------
+    Args:
+        - flights -> list[dict] --- 便データ
+        - flight_type -> str --- フライトタイプ ('departure' or 'arrival')
+    ----------------------------------------------------------------------
+    Returns:
+        - index -> dict[tuple, dict] --- {(便名, 日付, 連番): データ行}
+    ----------------------------------------------------------------------
+    Notes:
+        - author         Kidera-Shunsuke
+        - revision       v2.00 (2026/11/12) - 新規作成
+    ----------------------------------------------------------------------
+    """
+    sched_key = '出発時間（予定）' if flight_type == 'departure' else '到着時間（予定）'
+    index = {}
+    counts = {}
+    for item in sorted(flights, key=lambda r: (str(r.get('取得日') or ''), str(r.get(sched_key) or ''))):
+        base = (str(item.get('便名') or '').strip(), str(item.get('取得日') or '').strip())
+        n = counts.get(base, 0)
+        counts[base] = n + 1
+        index[(base[0], base[1], n)] = item
+    return index
+
+
+# @function name:   index_flights
 # @function end
 # ======================================================================================#
 
@@ -195,120 +300,86 @@ def normalize_value(value):
 # ======================================================================================#
 # @function name:   compare_data
 # @function start
-def compare_data(previous, current):
+def compare_data(previous, current, window_dates, failed_dates, flight_type):
     """
     ----------------------------------------------------------------------
-    関数概要：データを比較して変更を検出
-    - 前回データと現在データを比較
-    - 完全に新しい便名のみを新規として検出
-    - 予定時間または実際の時間の変更を検出（便名・日付で照合）
-    - 削除は通知対象外（ノイズ削減）
+    関数概要：前回データと今回データを比較して、変更があった便を検出する
+    - 同じ便（便名 + 日付）: 予定時刻・最新時刻・状態のどれかが違えば「変更」
+    - 今回だけにある便: 前回すでに監視していた日付なら「追加」
+                        （監視期間が進んで見えるようになっただけの便は対象外）
+    - 前回だけにある便: 取得に失敗した日付 → 持ち越し（通知しない）
+                        監視期間の外に出た → 何もしない
+                        それ以外 → 「削除」（出発/到着済み・欠航の便は対象外）
+    - 同じ便名の「削除」と「追加」が前後 MOVE_MAX_DAYS 日以内にあれば「日付変更」にまとめる
     ----------------------------------------------------------------------
     Args:
-        - previous -> list --- 前回取得したデータ
-        - current -> list --- 現在取得したデータ
+        - previous -> dict | None --- 前回のキャッシュ（load_cache の戻り値。None は初回）
+        - current -> list[dict] --- 今回取得したデータ
+        - window_dates -> list[str] --- 今回の監視期間の日付（YYYYMMDD）
+        - failed_dates -> set[str] --- 今回取得に失敗した日付
+        - flight_type -> str --- フライトタイプ ('departure' or 'arrival')
     ----------------------------------------------------------------------
     Returns:
-        - (has_changes, summary, changes) -> tuple[bool, str, list] --- 変更有無、変更内容の説明、変更データリスト
+        - (changes, carried) -> tuple[list[dict], dict] ---
+              changes: 変更情報のリスト（flight_type / kind / key / row / prev / prev_key）
+              carried: 取得失敗のため前回データを持ち越す便 {照合キー: データ行}
     ----------------------------------------------------------------------
     Notes:
         - author         Kidera-Shunsuke
         - revision       v1.05 (2025/11/08) - 実際の時間変更検出修正（便名・日付のみで照合）
+        - revision       v2.00 (2026/11/12) - 全面改修（状態の変化・追加・削除・日付変更を検出、
+                                              監視期間のずれと取得失敗による誤検出を防止）
     ----------------------------------------------------------------------
     """
     if previous is None:
-        return True, "初回実行のため全データを通知", current
-    
-    changes = []
-    changed_items = []  # 変更があったアイテムを格納
-    
-    # 前回のデータを辞書に変換（便名と日付のみをキーにする）
-    prev_dict = {}  # 便名と日付をキーにした辞書
-    prev_flight_names = set()  # 前回存在した便名の一覧
-    for item in previous:
-        flight_key = (normalize_value(item.get('便名')), normalize_value(item.get('取得日')))
-        prev_dict[flight_key] = item
-        prev_flight_names.add(normalize_value(item.get('便名')))
-    
-    # 現在のデータを辞書に変換
-    curr_dict = {}
-    curr_flight_names = set()  # 現在存在する便名の一覧
-    for item in current:
-        flight_key = (normalize_value(item.get('便名')), normalize_value(item.get('取得日')))
-        curr_dict[flight_key] = item
-        curr_flight_names.add(normalize_value(item.get('便名')))
-    
-    # 新規追加されたフライト（完全に新しい便名のみ）
-    new_flight_names = curr_flight_names - prev_flight_names
-    
-    if new_flight_names:
-        print(f"  + 新規便名: {new_flight_names}")
-        changes.append(f"新規: {len(new_flight_names)}件")
-        
-        # 新規便名のデータを変更リストに追加
-        for flight_key, item in curr_dict.items():
-            if normalize_value(item.get('便名')) in new_flight_names:
-                new_item = item.copy()
-                new_item['変更種別'] = '新規'
-                changed_items.append(new_item)
-    
-    # 削除されたフライトは通知しない（コメントアウト）
-    # removed_flight_names = prev_flight_names - curr_flight_names
-    
-    # 出発時間/到着時間の変更をチェック（便名・日付で照合）
-    time_changes = set()  # 時間変更があった便名を記録（重複排除）
-    
-    for flight_key, curr_item in curr_dict.items():
-        # 前回データに同じ便名・日付の組み合わせがあるかチェック
-        if flight_key in prev_dict:
-            prev_item = prev_dict[flight_key]
-            
-            # 予定時間の変更をチェック
-            prev_scheduled = normalize_value(prev_item.get('出発時間（予定）')) or normalize_value(prev_item.get('到着時間（予定）'))
-            curr_scheduled = normalize_value(curr_item.get('出発時間（予定）')) or normalize_value(curr_item.get('到着時間（予定）'))
-            
-            # 実際の時間の変更をチェック
-            prev_actual = normalize_value(prev_item.get('出発時間（実際）')) or normalize_value(prev_item.get('到着時間（実際）'))
-            curr_actual = normalize_value(curr_item.get('出発時間（実際）')) or normalize_value(curr_item.get('到着時間（実際）'))
-            
-            # 予定時間または実際の時間が変更された場合
-            if prev_scheduled != curr_scheduled or prev_actual != curr_actual:
-                # どちらが変更されたか判定
-                change_details = []
-                
-                if prev_scheduled != curr_scheduled:
-                    prev_sch_str = prev_scheduled if prev_scheduled is not None else "未定"
-                    curr_sch_str = curr_scheduled if curr_scheduled is not None else "未定"
-                    change_details.append(f"予定: {prev_sch_str} → {curr_sch_str}")
-                
-                if prev_actual != curr_actual:
-                    prev_act_str = prev_actual if prev_actual is not None else "未定"
-                    curr_act_str = curr_actual if curr_actual is not None else "未定"
-                    change_details.append(f"実際: {prev_act_str} → {curr_act_str}")
-                
-                change_summary = ", ".join(change_details)
-                flight_name = normalize_value(curr_item.get('便名'))
-                flight_date = normalize_value(curr_item.get('取得日'))
-                print(f"  ⏰ 時間変更: {flight_name} ({flight_date}) {change_summary}")
-                
-                # 変更後のデータを追加（新規便名を除外）
-                if flight_name not in new_flight_names:
-                    item = curr_item.copy()
-                    item['変更種別'] = '時間変更'
-                    # 前回の時間情報を記録
-                    item['前回予定時間'] = prev_scheduled if prev_scheduled is not None else "未定"
-                    item['前回実際時間'] = prev_actual if prev_actual is not None else "未定"
-                    changed_items.append(item)
-                    time_changes.add(flight_name)
-    
-    if time_changes:
-        changes.append(f"時間変更: {len(time_changes)}件")
+        return [], {}
 
-    
-    if changes:
-        return True, ", ".join(changes), changed_items
-    else:
-        return False, "変更なし", []
+    signature = IncheonCargoScraper.flight_signature
+    prev_index = index_flights(previous['flights'], flight_type)
+    curr_index = index_flights(current, flight_type)
+    prev_covered = previous['covered_dates']
+    window = set(window_dates)
+
+    changes = []
+    carried = {}
+
+    # 今回ある便: 変更 / 追加
+    for key, row in curr_index.items():
+        if key in prev_index:
+            prev_row = prev_index[key]
+            if signature(prev_row, flight_type) != signature(row, flight_type):
+                changes.append({'flight_type': flight_type, 'kind': 'changed', 'key': key, 'row': row, 'prev': prev_row})
+        elif key[1] in prev_covered:
+            changes.append({'flight_type': flight_type, 'kind': 'new', 'key': key, 'row': row, 'prev': None})
+
+    # 前回だけにある便: 持ち越し / 削除
+    for key, prev_row in prev_index.items():
+        if key in curr_index:
+            continue
+        if key[1] in failed_dates:
+            carried[key] = prev_row
+        elif key[1] in window and NOTIFY_REMOVED:
+            phase = IncheonCargoScraper.flight_state(prev_row, flight_type)['phase']
+            if phase not in ('done', 'cancelled'):
+                changes.append({'flight_type': flight_type, 'kind': 'removed', 'key': key, 'row': prev_row, 'prev': None})
+
+    # 同じ便名の「削除」+「追加」（日付差 MOVE_MAX_DAYS 以内）は「日付変更」1 件にまとめる
+    for removed in [c for c in changes if c['kind'] == 'removed']:
+        best = None
+        for added in [c for c in changes if c['kind'] == 'new' and c['key'][0] == removed['key'][0]]:
+            try:
+                gap = abs((datetime.strptime(added['key'][1], '%Y%m%d') - datetime.strptime(removed['key'][1], '%Y%m%d')).days)
+            except ValueError:
+                continue
+            if gap <= MOVE_MAX_DAYS and (best is None or gap < best[0]):
+                best = (gap, added)
+        if best:
+            added = best[1]
+            added.update({'kind': 'moved', 'prev': removed['row'], 'prev_key': removed['key']})
+            changes.remove(removed)
+
+    changes.sort(key=lambda c: (c['key'][1], c['key'][0]))
+    return changes, carried
 
 
 # @function name:   compare_data
@@ -317,36 +388,85 @@ def compare_data(previous, current):
 
 
 # ======================================================================================#
-# @function name:   annotate_changes
+# @function name:   describe_change
 # @function start
-def annotate_changes(current, changed_items):
+def describe_change(change):
     """
     ----------------------------------------------------------------------
-    関数概要：全便データに変更情報（変更種別・前回値）を重ねた通知用データを作る
-    - Changi 通知と同じく「全便を載せ、変化した便に 🆕 / 🔔 を付ける」ための前処理
-    - 便名・取得日が一致する行を compare_data の変更データ（変更種別付き）に差し替える
-    - 元の current は変更しない（キャッシュ保存用にそのまま使えるようにする）
+    関数概要：変更情報をログ表示用の 1 行にする
+    - 例: [変更] K4217 (20261113) 予定 11:35 / 最新 - / scheduled → 予定 11:35 / 最新 17:05 / delayed
     ----------------------------------------------------------------------
     Args:
-        - current -> list --- 現在取得したデータ（全便）
-        - changed_items -> list --- compare_data が返した変更データ
+        - change -> dict --- compare_data が返した変更情報
     ----------------------------------------------------------------------
     Returns:
-        - rows -> list --- 通知用データ（全便。変化した便のみ変更種別・前回値付き）
+        - text -> str --- ログ表示用文字列
     ----------------------------------------------------------------------
     Notes:
         - author         Kidera-Shunsuke
-        - revision       v1.07 (2026/11/11) - 新規作成（Changi 通知に準拠）
+        - revision       v2.00 (2026/11/12) - 新規作成
     ----------------------------------------------------------------------
     """
-    def key_of(item):
-        return (normalize_value(item.get('便名')), normalize_value(item.get('取得日')))
+    def brief(row):
+        sig = IncheonCargoScraper.flight_signature(row, change['flight_type'])
+        return f"予定 {sig[0] or '-'} / 最新 {sig[1] or '-'} / {sig[2]}{' ' + sig[3] if sig[3] else ''}"
 
-    changed = {key_of(item): item for item in changed_items or [] if item.get('変更種別')}
-    return [changed.get(key_of(item), item) for item in current]
+    label = {'changed': '変更', 'new': '追加', 'removed': '削除', 'moved': '日付変更'}[change['kind']]
+    flight, day = change['key'][0], change['key'][1]
+    if change['kind'] == 'changed':
+        return f"[{label}] {flight} ({day}) {brief(change['prev'])} → {brief(change['row'])}"
+    if change['kind'] == 'moved':
+        return f"[{label}] {flight} ({change['prev_key'][1]}) {brief(change['prev'])} → ({day}) {brief(change['row'])}"
+    return f"[{label}] {flight} ({day}) {brief(change['row'])}"
 
 
-# @function name:   annotate_changes
+# @function name:   describe_change
+# @function end
+# ======================================================================================#
+
+
+# ======================================================================================#
+# @function name:   build_cache_flights
+# @function start
+def build_cache_flights(current, carried, failed_changes, flight_type):
+    """
+    ----------------------------------------------------------------------
+    関数概要：次回の比較に使う便データ（キャッシュに保存する内容）を組み立てる
+    - 基本は今回取得したデータ
+    - 取得に失敗した日付の便は前回データを持ち越す
+    - 通知に失敗した変更は「前回の状態」に戻しておき、次回もう一度検出・通知されるようにする
+    ----------------------------------------------------------------------
+    Args:
+        - current -> list[dict] --- 今回取得したデータ
+        - carried -> dict --- 持ち越す便 {照合キー: データ行}
+        - failed_changes -> list[dict] --- 通知に失敗した変更情報
+        - flight_type -> str --- フライトタイプ ('departure' or 'arrival')
+    ----------------------------------------------------------------------
+    Returns:
+        - flights -> list[dict] --- キャッシュに保存する便データ
+    ----------------------------------------------------------------------
+    Notes:
+        - author         Kidera-Shunsuke
+        - revision       v2.00 (2026/11/12) - 新規作成
+    ----------------------------------------------------------------------
+    """
+    saved = index_flights(current, flight_type)
+    saved.update(carried)
+    for change in failed_changes:
+        kind, key = change['kind'], change['key']
+        if kind == 'changed':
+            saved[key] = change['prev']                  # 前回の状態に戻す
+        elif kind == 'new':
+            saved.pop(key, None)                         # まだ無かったことにする
+        elif kind == 'removed':
+            saved[key] = change['row']                   # まだ在ることにする
+        elif kind == 'moved':
+            saved.pop(key, None)
+            saved[change['prev_key']] = change['prev']
+    return list(saved.values())
+
+
+# @function name:   build_cache_flights
 # @function end
 # ======================================================================================#
 
@@ -358,37 +478,40 @@ def main():
     """
     ----------------------------------------------------------------------
     関数概要：メイン処理 - 1時間ごとのチェック
-    - 7日分のデータ（出発便・到着便）を取得
+    - 前日〜6 日後のデータ（出発便・到着便）を取得
     - 前回データと比較
-    - 変更があった場合のみDiscordに通知（出発便・到着便を 1 メッセージ、変化した便に印）
+    - 変更があった便だけを 1 便 = 1 メッセージで Discord に個別通知
+    - 初回実行（キャッシュなし）は対象期間の全便を一覧で 1 回通知
     ----------------------------------------------------------------------
     Args:
         - なし
     ----------------------------------------------------------------------
     Returns:
-        なし (終了コードをsys.exitで返す)
+        なし (終了コードをsys.exitで返す。0 = 正常 / 1 = 取得失敗または通知失敗あり)
     ----------------------------------------------------------------------
     Notes:
         - author         Kidera-Shunsuke
         - revision       v1.01 (2025/11/01) - 到着便対応追加
         - revision       v1.07 (2026/11/11) - 通知を Changi 通知と同一フォーマットに変更
+        - revision       v2.00 (2026/11/12) - 変更があった便の個別通知に変更
     ----------------------------------------------------------------------
     """
-    
+
     # .envファイルから環境変数を取得
     webhook_url = os.getenv('DISCORD_WEBHOOK_URL')
-    
+
     if not webhook_url:
         print("エラー: 環境変数 DISCORD_WEBHOOK_URL が設定されていません")
         print("\n.envファイルを作成して以下の内容を記載してください:")
         print("  DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...")
         sys.exit(1)
-    
-    # 日付を計算
+
+    # 日付を計算（前日〜6 日後）
     today = datetime.now()
-    start_date = today.strftime('%Y%m%d')
-    end_date = (today + timedelta(days=6)).strftime('%Y%m%d')
-    
+    start_date = (today - timedelta(days=LOOKBACK_DAYS)).strftime('%Y%m%d')
+    end_date = (today + timedelta(days=LOOKAHEAD_DAYS)).strftime('%Y%m%d')
+    window_dates = date_range(start_date, end_date)
+
     print("=" * 60)
     print("【1時間ごとチェック】仁川国際空港 貨物スケジュール")
     print("=" * 60)
@@ -396,151 +519,111 @@ def main():
     print(f"期間: {start_date} ~ {end_date}")
     print(f"空港: NGO (名古屋)")
     print("=" * 60)
-    
+
     # スクレイパーを初期化
     scraper = IncheonCargoScraper()
-    
-    # 出発便データを取得
-    print("\n【出発便データ取得】")
-    print("=" * 60)
-    df_departure = scraper.scrape_multiple_dates(
-        start_date=start_date,
-        end_date=end_date,
-        airport='NGO',
-        output_format=None,
-        flight_type='departure'
-    )
-    
-    # 到着便データを取得
-    print("\n【到着便データ取得】")
-    print("=" * 60)
-    df_arrival = scraper.scrape_multiple_dates(
-        start_date=start_date,
-        end_date=end_date,
-        airport='NGO',
-        output_format=None,
-        flight_type='arrival'
-    )
-    
-    # データの確認
-    has_departure_data = df_departure is not None and len(df_departure) > 0
-    has_arrival_data = df_arrival is not None and len(df_arrival) > 0
-    
-    if not has_departure_data and not has_arrival_data:
+
+    # 出発便・到着便のデータを取得
+    current_data = {}                              # フライトタイプ → 今回のデータ
+    failed_dates = {}                              # フライトタイプ → 取得に失敗した日付
+    dataframes = {}                                # フライトタイプ → DataFrame（初回の一覧通知用）
+    for flight_type, label, _ in DIRECTIONS:
+        print(f"\n【{label}データ取得】")
+        print("=" * 60)
+        df = scraper.scrape_multiple_dates(
+            start_date=start_date,
+            end_date=end_date,
+            airport='NGO',
+            output_format=None,
+            flight_type=flight_type
+        )
+        dataframes[flight_type] = df
+        current_data[flight_type] = clean_records(df.to_dict('records')) if df is not None and len(df) > 0 else []
+        failed_dates[flight_type] = set(scraper.last_failed_dates.get(flight_type, set()))
+
+    # 全日付・全方向で取得に失敗した場合は何もせず終了（キャッシュは触らない）
+    if all(failed_dates[flight_type] >= set(window_dates) for flight_type, _, _ in DIRECTIONS):
         print("\n! データが取得できませんでした")
         sys.exit(1)
-    
-    # 変更検出フラグ
-    has_changes_overall = False
-    
-    # 出発便の変更チェック
-    has_changes_dep = False
-    changed_data_departure = []
-    if has_departure_data:
-        current_data_departure = df_departure.to_dict('records')
-        print("\n【出発便】前回データとの比較中...")
-        previous_data_departure = load_previous_data()
-        has_changes_dep, change_summary_dep, changed_data_departure = compare_data(previous_data_departure, current_data_departure)
-        print(f"出発便比較結果: {change_summary_dep}")
-        has_changes_overall = has_changes_overall or has_changes_dep
-    
-    # 到着便の変更チェック
-    has_changes_arr = False
-    changed_data_arrival = []
-    if has_arrival_data:
-        current_data_arrival = df_arrival.to_dict('records')
-        print("\n【到着便】前回データとの比較中...")
-        # 到着便用のキャッシュファイルから読み込み
-        if CACHE_FILE_ARRIVAL.exists():
-            try:
-                with open(CACHE_FILE_ARRIVAL, 'r', encoding='utf-8') as f:
-                    previous_data_arrival = json.load(f)
-            except Exception as e:
-                print(f"警告: 到着便キャッシュファイルの読み込みに失敗 - {e}")
-                previous_data_arrival = None
-        else:
-            previous_data_arrival = None
-        
-        has_changes_arr, change_summary_arr, changed_data_arrival = compare_data(previous_data_arrival, current_data_arrival)
-        print(f"到着便比較結果: {change_summary_arr}")
-        has_changes_overall = has_changes_overall or has_changes_arr
-    
-    if has_changes_overall:
-        print("\n変更が検出されました。Discordに通知を送信します...")
-        
-        # Changi 通知と同じく、出発便・到着便を 1 メッセージにまとめ、
-        # 全便を載せたうえで変化した便に 🆕 / 🔔 を付ける
-        print(f"\n【通知送信】変更データ: 出発便 {len(changed_data_departure)}件 / 到着便 {len(changed_data_arrival)}件")
-        df_departure_notify = pd.DataFrame(annotate_changes(current_data_departure, changed_data_departure)) if has_departure_data else pd.DataFrame()
-        df_arrival_notify = pd.DataFrame(annotate_changes(current_data_arrival, changed_data_arrival)) if has_arrival_data else pd.DataFrame()
-        success = scraper.send_discord_notification(
-            df_departure_notify, df_arrival_notify, start_date, end_date, 'NGO'
-        )
 
-        if success:
-            # 成功したら現在のデータを保存
-            if has_departure_data:
-                save_current_data(current_data_departure)
-            if has_arrival_data:
-                # 到着便データを別ファイルに保存
-                try:
-                    cleaned_data = []
-                    for item in current_data_arrival:
-                        cleaned_item = {}
-                        for key, value in item.items():
-                            if isinstance(value, float):
-                                import math
-                                if math.isnan(value):
-                                    cleaned_item[key] = None
-                                else:
-                                    cleaned_item[key] = value
-                            else:
-                                cleaned_item[key] = value
-                        cleaned_data.append(cleaned_item)
-                    
-                    with open(CACHE_FILE_ARRIVAL, 'w', encoding='utf-8') as f:
-                        json.dump(cleaned_data, f, ensure_ascii=False, indent=2)
-                    print(f"  到着便データをキャッシュに保存: {CACHE_FILE_ARRIVAL}")
-                except Exception as e:
-                    print(f"警告: 到着便キャッシュファイルの保存に失敗 - {e}")
-            
-            print("\n" + "=" * 60)
-            print("✓ 変更を検出し、通知を送信しました")
-            print("=" * 60)
-            sys.exit(0)
+    # 前回データとの比較
+    previous_data = {}                             # フライトタイプ → 前回のキャッシュ
+    carried_data = {}                              # フライトタイプ → 持ち越す便
+    all_changes = []                               # 全方向の変更情報
+    for flight_type, label, cache_file in DIRECTIONS:
+        print(f"\n【{label}】前回データとの比較中...")
+        previous = load_cache(cache_file)
+        previous_data[flight_type] = previous
+        changes, carried = compare_data(previous, current_data[flight_type], window_dates, failed_dates[flight_type], flight_type)
+        carried_data[flight_type] = carried
+        all_changes.extend(changes)
+        if previous is None:
+            print(f"{label}比較結果: 前回データなし（今回のデータを基準として保存）")
+        elif changes:
+            print(f"{label}比較結果: 変更 {len(changes)}件")
+            for change in changes:
+                print(f"  {describe_change(change)}")
         else:
+            print(f"{label}比較結果: 変更なし")
+        if carried:
+            print(f"  取得失敗のため前回データを持ち越し: {len(carried)}件")
+
+    # 初回実行（出発便・到着便ともキャッシュなし）: 全便を一覧で 1 回通知して基準データを保存
+    if all(previous_data[flight_type] is None for flight_type, _, _ in DIRECTIONS):
+        has_flights = any(current_data[flight_type] for flight_type, _, _ in DIRECTIONS)
+        if has_flights:
+            print("\n初回実行のため、対象期間の全便を一覧で通知します...")
+            success = scraper.send_discord_notification(
+                dataframes['departure'], dataframes['arrival'], start_date, end_date, 'NGO'
+            )
+        else:
+            print("\n初回実行ですが対象期間に便がないため、通知せず基準データだけ保存します")
+            success = True
+        if not success:
             print("\n! Discord通知に失敗しました")
             sys.exit(1)
-    else:
-        print("\n変更がないため、通知をスキップします")
-        # 変更がなくても現在のデータを保存（次回比較用）
-        if has_departure_data:
-            save_current_data(current_data_departure)
-        if has_arrival_data:
-            try:
-                cleaned_data = []
-                for item in current_data_arrival:
-                    cleaned_item = {}
-                    for key, value in item.items():
-                        if isinstance(value, float):
-                            import math
-                            if math.isnan(value):
-                                cleaned_item[key] = None
-                            else:
-                                cleaned_item[key] = value
-                        else:
-                            cleaned_item[key] = value
-                    cleaned_data.append(cleaned_item)
-                
-                with open(CACHE_FILE_ARRIVAL, 'w', encoding='utf-8') as f:
-                    json.dump(cleaned_data, f, ensure_ascii=False, indent=2)
-            except Exception as e:
-                print(f"警告: 到着便キャッシュファイルの保存に失敗 - {e}")
-        
+        for flight_type, _, cache_file in DIRECTIONS:
+            save_cache(cache_file, current_data[flight_type], set(window_dates) - failed_dates[flight_type])
         print("\n" + "=" * 60)
-        print("✓ チェック完了（変更なし）")
+        print("✓ 初回実行: 基準データを保存しました")
         print("=" * 60)
         sys.exit(0)
+
+    # 変更があった便を個別に通知
+    failed_changes = []
+    if all_changes:
+        print(f"\n変更が検出されました。Discordに個別通知を送信します...（{len(all_changes)}件）")
+        results = scraper.send_change_notifications(all_changes, 'NGO')
+        failed_changes = [change for change, ok in zip(all_changes, results) if not ok]
+    else:
+        print("\n変更がないため、通知をスキップします")
+
+    # 今回のデータを保存（次回比較用）
+    for flight_type, _, cache_file in DIRECTIONS:
+        previous = previous_data[flight_type]
+        # 監視済みの日付 = 今回取得できた日付 + 取得に失敗したが前回は監視済みだった日付
+        covered = set(window_dates) - failed_dates[flight_type]
+        if previous is not None:
+            covered |= failed_dates[flight_type] & previous['covered_dates']
+        flights = build_cache_flights(
+            current_data[flight_type],
+            carried_data[flight_type],
+            [change for change in failed_changes if change['flight_type'] == flight_type],
+            flight_type
+        )
+        save_cache(cache_file, flights, covered)
+
+    print("\n" + "=" * 60)
+    if failed_changes:
+        print(f"! 通知に失敗した変更が {len(failed_changes)}件あります（次回のチェックで再通知します）")
+        print("=" * 60)
+        sys.exit(1)
+    if all_changes:
+        print(f"✓ 変更を検出し、{len(all_changes)}件を個別に通知しました")
+    else:
+        print("✓ チェック完了（変更なし）")
+    print("=" * 60)
+    sys.exit(0)
 
 
 # @function name:   main

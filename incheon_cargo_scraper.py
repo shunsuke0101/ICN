@@ -4,8 +4,8 @@
 # @brief          仁川国際空港 貨物出発・到着スケジュール スクレイピングシステム
 # @author         Kidera Shunsuke
 # @date           2025/11/01
-# $Version:       3.03
-# $Revision:      2026/11/11
+# $Version:       4.00
+# $Revision:      2026/11/12
 # @note           仁川国際空港の貨物出発・到着スケジュールをWebスクレイピング
 #                 Discord Webhook通知機能を含む
 # @attention      プロジェクトのコーディングフォーマット・コメントフォーマット遵守
@@ -13,6 +13,8 @@
 #                 到着便APIエンドポイント: https://www.airport.kr/arrCargo/ap_ja/arrCargoSchList.do
 #                 データ構造: div.data > div.body > div.group > div.row
 #                 駐機場: div.jugi、状態: div.state（列番号は出発便 col5/col6・到着便 col6/col7 と異なる）
+#                 時刻欄: <strong>最新時刻</strong><span>当初予定</span>（変更なしの便は <strong>予定</strong> のみ）
+#                         最新時刻が実績か見込みかは状態欄（出発 / 到着 / 遅延 / 欠航 / 空）で決まる
 # @par            History
 #                 v1.00 (2025/11/01) - 初期実装・Discord通知機能追加
 #                 v1.01 (2025/11/01) - 到着便データ取得機能追加・CSV出力デフォルト無効化
@@ -21,6 +23,13 @@
 #                 v3.02 (2026/11/09) - 駐機場をクラス名で取得（到着便の列ずれ修正）・通知に駐機場を表示
 #                 v3.03 (2026/11/11) - Discord 通知フォーマットを Changi 通知に完全準拠
 #                                      （出発便・到着便を 1 メッセージに統合・見出し／フッター文言・便間の空行）
+#                 v4.00 (2026/11/12) - 時刻・状態の判定を全面見直し
+#                                      ・最新時刻を「実績」と決めつけず、状態欄から 実績 / 見込み を判定（flight_state）
+#                                        （遅延・時刻変更の便が「出発済み」と表示されていた不具合を解消）
+#                                      ・日またぎ（予定 00:05 → 実績 前日 23:51 など）の日付を補正し、名古屋側の推定時刻を修正
+#                                      ・列名 '出発時間（実際）' / '到着時間（実際）' を '…（最新）' に変更
+#                                      ・変更があった便の個別通知（send_change_notifications）を追加
+#                                      ・取得失敗と「該当便なし」を区別（last_failed_dates）
 # Copyright (c) 2025-2026. All Rights reserved.
 #
 # -----------------------------------------------------------------------------------#
@@ -37,6 +46,8 @@
     - 複数日のデータ取得（並列）
     - CSV/JSON/Excel 形式でのエクスポート
     - Discord Webhook 通知（Changi / 香港 / 上海 の通知と共通のフォーマット）
+      - 一覧通知: send_discord_notification（出発便・到着便を 1 メッセージ）
+      - 個別通知: send_change_notifications（変更があった便を 1 便 = 1 メッセージ）
 ========================================================================================
 """
 
@@ -108,6 +119,7 @@ class IncheonCargoScraper:
         Notes:
             - author         Kidera-Shunsuke
             - revision       v1.01 (2025/11/01) - 到着便対応追加
+            - revision       v4.00 (2026/11/12) - last_failed_dates を追加
         ----------------------------------------------------------------------
         """
         # 実際のAPIエンドポイント（encパラメータをデコードして取得）
@@ -126,6 +138,8 @@ class IncheonCargoScraper:
             'Referer': 'https://www.airport.kr/'
         }
         self.session = requests.Session()
+        # 直近の scrape_multiple_dates で取得に失敗した日付（flight_type → set[YYYYMMDD]）
+        self.last_failed_dates = {'departure': set(), 'arrival': set()}
 
     # @function name:   __init__
     # @function end
@@ -266,6 +280,7 @@ class IncheonCargoScraper:
             - author         Kidera-Shunsuke
             - revision       v1.01 (2025/11/01) - 到着便対応追加
             - revision       v3.02 (2026/11/09) - 駐機場・状態をクラス名（jugi / state）で取得
+            - revision       v4.00 (2026/11/12) - 時刻欄を「予定」「最新」として取得（旧: 最新時刻を「実際」として取得）
         ----------------------------------------------------------------------
         """
         cargo_data = []
@@ -274,7 +289,7 @@ class IncheonCargoScraper:
         
         # 出発便か到着便かでキー名を設定
         time_key_scheduled = '出発時間（予定）' if flight_type == 'departure' else '到着時間（予定）'
-        time_key_actual = '出発時間（実際）' if flight_type == 'departure' else '到着時間（実際）'
+        time_key_latest = '出発時間（最新）' if flight_type == 'departure' else '到着時間（最新）'
         location_key = '目的地' if flight_type == 'departure' else '出発地'
         status_key = '出発状態' if flight_type == 'departure' else '到着状態'
         
@@ -308,30 +323,24 @@ class IncheonCargoScraper:
                         # 時間（出発または到着）
                         col1 = toggle_row.find('div', class_='col1')
                         if col1:
-                            # 予定時間を取得（strong要素内）
-                            time_elem = col1.find('strong')
-                            original_scheduled = None
-                            if time_elem:
-                                original_scheduled = time_elem.get_text(strip=True)
-                            
-                            # 実際の時間を取得（span要素内）
-                            # time divの中のspanを探す
-                            actual_time = None
-                            time_div = col1.find('div', class_='time')
-                            if time_div:
-                                # span要素を直接探す
-                                time_span = time_div.find('span')
-                                if time_span:
-                                    actual_time = time_span.get_text(strip=True)
-                            
-                            # 実際の時間が存在する場合、時間を入れ替える
-                            # 予定 ← 実際の時間、実際 ← もともとの予定時間
-                            if actual_time:
-                                row_data[time_key_scheduled] = actual_time
-                                row_data[time_key_actual] = original_scheduled
+                            # 時刻欄の構造（v4.00 で解釈を見直し）:
+                            #   変更なし: <strong>予定時刻</strong>
+                            #   変更あり: <strong>最新時刻</strong><span>当初の予定時刻</span>
+                            # 最新時刻は「実績」とは限らない（遅延・時刻変更の見込み時刻のこともある）。
+                            # 実績かどうかは状態欄で決まるため、ここでは「予定」「最新」としてそのまま保持し、
+                            # 解釈は flight_state に任せる。
+                            time_div = col1.find('div', class_='time') or col1
+                            strong_elem = time_div.find('strong')
+                            span_elem = time_div.find('span')
+                            strong_time = strong_elem.get_text(strip=True) if strong_elem else None
+                            span_time = span_elem.get_text(strip=True) if span_elem else None
+
+                            if span_time:
+                                row_data[time_key_scheduled] = span_time
+                                row_data[time_key_latest] = strong_time if strong_time != span_time else None
                             else:
-                                # 実際の時間がない場合は予定時間のみ
-                                row_data[time_key_scheduled] = original_scheduled
+                                row_data[time_key_scheduled] = strong_time
+                                row_data[time_key_latest] = None
                         
                         # 目的地または出発地
                         col2 = toggle_row.find('div', class_='col2')
@@ -492,11 +501,13 @@ class IncheonCargoScraper:
             - flight_type -> str --- フライトタイプ ('departure' or 'arrival')
         ----------------------------------------------------------------------
         Returns:
-            - df -> pd.DataFrame --- スクレイピングされたデータ
+            - df -> pd.DataFrame | None --- スクレイピングされたデータ
+                                            （該当便なしは空の DataFrame、取得失敗は None）
         ----------------------------------------------------------------------
         Notes:
             - author         Kidera-Shunsuke
             - revision       v1.01 (2025/11/01) - 到着便対応追加
+            - revision       v4.00 (2026/11/12) - 「該当便なし」と確認できない空データは取得失敗（None）として返す
         ----------------------------------------------------------------------
         """
         params = self.build_params(date_str, airport, flight_type=flight_type)
@@ -523,22 +534,26 @@ class IncheonCargoScraper:
         cargo_data = self.parse_cargo_table(soup, flight_type)
         
         if not cargo_data:
-            print("警告: データが見つかりませんでした")
-            print("  ヒント: 日付やパラメータを確認してください")
-            print("  save_html=True を設定してHTMLを確認することができます")
+            # v4.00: サイトが「該当便なし」と明示している場合だけ 0 件として扱う。
+            #        メンテナンス画面・構造変更などで読めなかった場合は取得失敗（None）にして、
+            #        呼び出し側（変更検出）が「便が削除された」と誤判定しないようにする。
+            no_data_confirmed = soup.find('div', class_='no-data') is not None or \
+                soup.find(string=re.compile(r'照会されたデータがありません|there is no registered data', re.IGNORECASE)) is not None
+            if not no_data_confirmed:
+                print("警告: スケジュール表を読み取れませんでした（取得失敗として扱います）")
+                print("  save_html=True を設定してHTMLを確認することができます")
+                return None
+            print("情報: 該当する便はありません")
             return pd.DataFrame()
         
         # DataFrameに変換
         df = pd.DataFrame(cargo_data)
         
-        # 必須の列が存在することを保証（実際の時間が存在しない場合でも列を作成）
-        time_key_scheduled = '出発時間（予定）' if flight_type == 'departure' else '到着時間（予定）'
-        time_key_actual = '出発時間（実際）' if flight_type == 'departure' else '到着時間（実際）'
-        
-        if time_key_actual not in df.columns:
-            df[time_key_actual] = None
+        # 必須の列が存在することを保証（最新時刻・状態が 1 件も無い日でも列を作成）
         # v3.02: 駐機場・ターミナル列も常に存在させる（未割当日はキャッシュ上 null になる）
-        for key in ('ターミナル', '駐機場'):
+        time_key_latest = '出発時間（最新）' if flight_type == 'departure' else '到着時間（最新）'
+        status_key = '出発状態' if flight_type == 'departure' else '到着状態'
+        for key in (time_key_latest, 'ターミナル', '駐機場', status_key):
             if key not in df.columns:
                 df[key] = None
 
@@ -624,10 +639,12 @@ class IncheonCargoScraper:
         ----------------------------------------------------------------------
         Returns:
             - df -> pd.DataFrame --- 結合されたデータ
+                                     （取得に失敗した日付は self.last_failed_dates[flight_type] に入る）
         ----------------------------------------------------------------------
         Notes:
             - author         Kidera-Shunsuke
             - revision       v1.01 (2025/11/01) - 到着便対応追加
+            - revision       v4.00 (2026/11/12) - 取得に失敗した日付を last_failed_dates に記録
         ----------------------------------------------------------------------
         """
         all_data = []
@@ -652,6 +669,12 @@ class IncheonCargoScraper:
         with ThreadPoolExecutor(max_workers=min(3, len(dates))) as ex:
             results = list(ex.map(_one, dates))
         print(f"\n{len(dates)} 日分を {time.perf_counter() - t0:.1f} 秒で取得")
+
+        # v4.00: 取得失敗（None）の日付を記録（「該当便なし」の空 DataFrame とは区別する）
+        failed_dates = {date_str for date_str, df in results if df is None}
+        self.last_failed_dates[flight_type] = failed_dates
+        if failed_dates:
+            print(f"! 取得に失敗した日付: {', '.join(sorted(failed_dates))}")
 
         for date_str, df in results:
             if df is not None and len(df) > 0:
@@ -682,6 +705,17 @@ class IncheonCargoScraper:
     FLIGHT_MIN_NGO_ICN = int(os.getenv('FLIGHT_MINUTES_NGO_ICN', '125'))  # NGO→ICN 所要時間（分）
     WEEKDAY_JA = "月火水木金土日"                                          # 曜日表記（weekday() のインデックス順）
     JST = timezone(timedelta(hours=9), 'JST')                              # 日本時間（韓国時間と同じ UTC+9。tzdata 不要の固定オフセット）
+
+    # 最新時刻（HH:MM のみ）の日付を決めるときの許容幅（分）。
+    # 予定より LATE_MAX_MIN を超えて遅く見える時刻は前日、EARLY_MAX_MIN を超えて早く見える時刻は翌日とみなす
+    EARLY_MAX_MIN = 6 * 60                                                 # 早発・早着として扱う上限（6 時間）
+    LATE_MAX_MIN = 18 * 60                                                 # 遅延として扱う上限（18 時間）
+
+    # 状態欄の判定キーワード（日本語サイトの表記 + 韓国語・英語サイトの表記。英語は小文字で比較）
+    STATUS_CANCELLED = ('欠航', '결항', 'cancel')                          # 欠航
+    STATUS_DELAYED = ('遅延', '지연', 'delay')                             # 遅延（まだ出発/到着していない）
+    STATUS_DONE_DEP = ('出発', '출발', 'depart')                           # 出発済み
+    STATUS_DONE_ARR = ('到着', '도착', 'arriv', '着陸', '착륙', 'land')    # 到着済み
 
     # ======================================================================================#
     # @function name:   _color
@@ -907,24 +941,239 @@ class IncheonCargoScraper:
     # ======================================================================================#
 
     # ======================================================================================#
+    # @function name:   _norm_hhmm
+    # @function start
+    @classmethod
+    def _norm_hhmm(cls, value):
+        """
+        ----------------------------------------------------------------------
+        関数概要：時刻文字列を 'HH:MM' に正規化する
+        - 例: '4:05' → '04:05'、None / NaN / '' / '未定' → None
+        ----------------------------------------------------------------------
+        Args:
+            - value -> Any --- 時刻を含む値
+        ----------------------------------------------------------------------
+        Returns:
+            - hhmm -> str | None --- 'HH:MM'（時刻として読めない場合は None）
+        ----------------------------------------------------------------------
+        Notes:
+            - author         Kidera-Shunsuke
+            - revision       v4.00 (2026/11/12) - 新規作成
+        ----------------------------------------------------------------------
+        """
+        if not cls._is_str(value):
+            return None
+        m = re.search(r'(\d{1,2}):(\d{2})', value)
+        if not m or int(m.group(1)) > 23 or int(m.group(2)) > 59:
+            return None
+        return f"{int(m.group(1)):02d}:{m.group(2)}"
+
+    # @function name:   _norm_hhmm
+    # @function end
+    # ======================================================================================#
+
+    # ======================================================================================#
+    # @function name:   flight_state
+    # @function start
+    @classmethod
+    def flight_state(cls, row, flight_type, now=None):
+        """
+        ----------------------------------------------------------------------
+        関数概要：1 便の「いまの状態」を判定する（時刻・状態の解釈はここに一本化）
+        - サイトの時刻欄は <strong>最新時刻</strong><span>当初予定</span> の 2 段構成で、
+          最新時刻が「実績」か「見込み」かは時刻欄だけでは分からない。状態欄で判定する:
+            状態 = 出発 / 到着      → done      （最新時刻 = 実績。最新時刻なしは予定どおり）
+            状態 = 遅延             → delayed   （最新時刻 = 見込み。まだ出発/到着していない）
+            状態 = 欠航             → cancelled
+            状態 = その他の文言     → other     （最新時刻 = 見込み）
+            状態なし・最新時刻あり  → estimated （時刻変更。最新時刻 = 見込み）
+            状態なし・最新時刻なし  → scheduled （予定どおり）
+        - 最新時刻は時刻（HH:MM）しか無いので、予定時刻との前後関係から日付を決める
+          （予定 00:05 → 実績 23:51 は前日、予定 22:00 → 見込み 01:30 は翌日）
+        ----------------------------------------------------------------------
+        Args:
+            - row -> pd.Series | dict --- 1 便分のデータ
+            - flight_type -> str --- フライトタイプ ('departure' or 'arrival')
+            - now -> datetime | None --- 現在時刻（KST/JST、tz なし）。実績時刻が未来になる日付ずれの補正に使う
+        ----------------------------------------------------------------------
+        Returns:
+            - state -> dict --- phase / sched_txt / latest_txt / status_raw /
+                                sched_dt（予定）/ latest_dt（最新）/ time_dt（表示・名古屋側推定に使う時刻。欠航は None）
+        ----------------------------------------------------------------------
+        Notes:
+            - author         Kidera-Shunsuke
+            - revision       v4.00 (2026/11/12) - 新規作成（最新時刻を常に「出発済み」扱いしていた不具合を解消）
+        ----------------------------------------------------------------------
+        """
+        is_dep = (flight_type == 'departure')
+        prefix = '出発' if is_dep else '到着'
+        date_str = str(row.get('取得日', '') or '')
+
+        # 時刻（旧キャッシュは最新時刻を「（実際）」キーで持っているので読み替える）
+        sched_txt = cls._norm_hhmm(row.get(f'{prefix}時間（予定）'))
+        latest_txt = cls._norm_hhmm(row.get(f'{prefix}時間（最新）')) or cls._norm_hhmm(row.get(f'{prefix}時間（実際）'))
+        if latest_txt == sched_txt:
+            latest_txt = None
+
+        # 状態欄から段階を判定
+        status_raw = row.get(f'{prefix}状態', '')
+        status_raw = status_raw.strip() if cls._is_str(status_raw) else ''
+        low = status_raw.lower()
+        done_words = cls.STATUS_DONE_DEP if is_dep else cls.STATUS_DONE_ARR
+        if any(w in low for w in cls.STATUS_CANCELLED):
+            phase = 'cancelled'
+        elif any(w in low for w in cls.STATUS_DELAYED):
+            phase = 'delayed'
+        elif any(w in low for w in done_words):
+            phase = 'done'
+        elif status_raw:
+            phase = 'other'
+        elif latest_txt:
+            phase = 'estimated'
+        else:
+            phase = 'scheduled'
+
+        # 最新時刻の日付を決める（予定より LATE_MAX_MIN 超の遅れに見える → 実は前日、
+        # EARLY_MAX_MIN 超の早発・早着に見える → 実は翌日）
+        sched_dt = cls._parse_hhmm(date_str, sched_txt)
+        latest_dt = cls._parse_hhmm(date_str, latest_txt)
+        if sched_dt and latest_dt:
+            diff_min = (latest_dt - sched_dt).total_seconds() / 60
+            if diff_min > cls.LATE_MAX_MIN:
+                latest_dt -= timedelta(days=1)
+            elif diff_min < -cls.EARLY_MAX_MIN:
+                latest_dt += timedelta(days=1)
+        # 実績なのに未来の時刻になる場合は日付の取り違えなので 1 日戻す
+        if phase == 'done' and latest_dt and now and latest_dt > now + timedelta(minutes=10):
+            latest_dt -= timedelta(days=1)
+
+        time_dt = None if phase == 'cancelled' else (latest_dt or sched_dt)
+        return {
+            'phase': phase, 'status_raw': status_raw,
+            'sched_txt': sched_txt, 'latest_txt': latest_txt,
+            'sched_dt': sched_dt, 'latest_dt': latest_dt, 'time_dt': time_dt,
+        }
+
+    # @function name:   flight_state
+    # @function end
+    # ======================================================================================#
+
+    # ======================================================================================#
+    # @function name:   flight_signature
+    # @function start
+    @classmethod
+    def flight_signature(cls, row, flight_type):
+        """
+        ----------------------------------------------------------------------
+        関数概要：変更検出用の比較キー（予定時刻・最新時刻・段階）を返す
+        - 前回と今回でこの値が違えば「変更あり」
+        - 駐機場・ターミナルの割当は含めない（当日に必ず変わるため通知対象外）
+        ----------------------------------------------------------------------
+        Args:
+            - row -> pd.Series | dict --- 1 便分のデータ（旧形式のキャッシュ行も可）
+            - flight_type -> str --- フライトタイプ ('departure' or 'arrival')
+        ----------------------------------------------------------------------
+        Returns:
+            - signature -> tuple --- (予定時刻, 最新時刻, 段階, その他状態の文言)
+        ----------------------------------------------------------------------
+        Notes:
+            - author         Kidera-Shunsuke
+            - revision       v4.00 (2026/11/12) - 新規作成
+        ----------------------------------------------------------------------
+        """
+        st = cls.flight_state(row, flight_type)
+        return (st['sched_txt'], st['latest_txt'], st['phase'], st['status_raw'] if st['phase'] == 'other' else '')
+
+    # @function name:   flight_signature
+    # @function end
+    # ======================================================================================#
+
+    # ======================================================================================#
+    # @function name:   _status_line
+    # @function start
+    def _status_line(self, st, is_dep, with_sched=False):
+        """
+        ----------------------------------------------------------------------
+        関数概要：flight_state の結果を見やすい状態文（1 行）に変換する
+        - 🟢 定刻どおり
+        - 🟡 時刻変更 → 23:10（予定 22:00、+70分）        ← 見込み（まだ出発/到着していない）
+        - 🟠 遅延 → 17:05（予定 11:35、+330分）           ← 見込み（まだ出発/到着していない）
+        - ✅ 出発済み 22:40（予定 22:00、+40分）          ← 実績
+        - 🔴 欠航 / 🔵 その他（サイトの状態文）
+        - 時刻が予定日と別の日になる場合は日付も付ける（例: → 11/14(土) 01:30）
+        ----------------------------------------------------------------------
+        Args:
+            - st -> dict --- flight_state の戻り値
+            - is_dep -> bool --- 出発便かどうか
+            - with_sched -> bool --- 時刻を含まない状態文にも「（予定 HH:MM）」を付けるか
+        ----------------------------------------------------------------------
+        Returns:
+            - line -> str --- 状態文
+        ----------------------------------------------------------------------
+        Notes:
+            - author         Kidera-Shunsuke
+            - revision       v4.00 (2026/11/12) - 新規作成（_pretty_status を置き換え。見込みと実績を区別）
+        ----------------------------------------------------------------------
+        """
+        tag = "出発" if is_dep else "到着"
+        sched_dt, sched_txt = st['sched_dt'], st['sched_txt'] or "--:--"
+
+        # 時刻（予定日と別の日なら日付付き）
+        def at(dt):
+            if sched_dt and dt.date() != sched_dt.date():
+                return f"{self._fmt_md(dt)} {dt:%H:%M}"
+            return f"{dt:%H:%M}"
+
+        # 予定との差（'（予定 22:00、+70分）'）
+        def versus(dt):
+            if sched_dt is None:
+                return ""
+            d = int(round((dt - sched_dt).total_seconds() / 60))
+            return f"（予定 {sched_txt}、定刻）" if d == 0 else f"（予定 {sched_txt}、{d:+d}分）"
+
+        phase, latest_dt = st['phase'], st['latest_dt']
+        sched_note = f"（予定 {sched_txt}）" if with_sched and st['sched_txt'] else ""
+        if phase == 'cancelled':
+            return "🔴 欠航" + sched_note
+        if phase == 'done':
+            t = st['time_dt']
+            return f"✅ {tag}済み {at(t)}{versus(t)}" if t else f"✅ {tag}済み"
+        if phase == 'delayed':
+            return f"🟠 遅延 → {at(latest_dt)}{versus(latest_dt)}" if latest_dt else "🟠 遅延" + sched_note
+        if phase == 'estimated' and latest_dt:
+            return f"🟡 時刻変更 → {at(latest_dt)}{versus(latest_dt)}"
+        if phase == 'other':
+            return f"🔵 {st['status_raw']}" + (f" → {at(latest_dt)}{versus(latest_dt)}" if latest_dt else sched_note)
+        return "🟢 定刻どおり" + sched_note
+
+    # @function name:   _status_line
+    # @function end
+    # ======================================================================================#
+
+    # ======================================================================================#
     # @function name:   _format_row
     # @function start
-    def _format_row(self, row, flight_type, today):
+    def _format_row(self, row, flight_type, today, now=None, change=None):
         """
         ----------------------------------------------------------------------
         関数概要：1 便を Discord 埋め込みフィールド 1 枠に整形する
         - name : 🛫 K4 219 ｜ 今日 11/08 (日)
         - value: ICN → NGO → CVG
-                 `🛫 ICN 11/08(日) 22:00 KST`
-                 `🛬 NGO 11/08(日) 23:55 JST (推定)`
+                 `🛫 ICN 11/08(日) 22:40 KST (実績)`
+                 `🛬 NGO 11/09(月) 00:35 JST (推定)`
                  `ICN Cargo(N) ・ 駐機場 675`
-                 🟢 定刻どおり
-        - hourly_check の差分情報（変更種別・前回予定時間・前回実際時間）があれば前回値も添える
+                 ✅ 出発済み 22:40（予定 22:00、+40分）
+        - ICN 側の時刻は「実績 > 見込み > 予定」の順で分かっている最新のものを表示し、
+          実績は (実績)、見込みは (見込み) を付ける（予定どおりの場合は何も付けない）
+        - 名古屋側の時刻は ICN 側の表示時刻 ± 標準所要時間（推定）
+        - change を渡すと、変更内容（前回の状態など）を状態文の下に添える
         ----------------------------------------------------------------------
         Args:
-            - row -> pd.Series --- 1 便分のデータ行
+            - row -> pd.Series | dict --- 1 便分のデータ行（削除通知では前回のデータ行）
             - flight_type -> str --- フライトタイプ ('departure' or 'arrival')
             - today -> date --- 基準日（相対日付ラベル用）
+            - now -> datetime | None --- 現在時刻（tz なし。flight_state の日付補正用）
+            - change -> dict | None --- 変更情報 {'kind': 'new' | 'changed' | 'moved' | 'removed', 'prev': 前回のデータ行}
         ----------------------------------------------------------------------
         Returns:
             - field -> dict --- 埋め込みフィールド（name / value / inline）
@@ -934,59 +1183,35 @@ class IncheonCargoScraper:
             - revision       v3.00 (2026/11/08) - Changi 通知と共通の表形式に変更
             - revision       v3.02 (2026/11/09) - ターミナル・駐機場の行を追加
             - revision       v3.03 (2026/11/11) - 予定時刻が欠損している行でも前回値の比較で例外にならないよう修正
+            - revision       v4.00 (2026/11/12) - 時刻・状態の判定を flight_state に一本化（実績 / 見込みを区別、日またぎ対応）
+                                                  変更情報を '変更種別' 列ではなく change 引数で受け取る
         ----------------------------------------------------------------------
         """
         is_dep = (flight_type == 'departure')
         date_str = str(row.get('取得日', '') or '')
-        sched_key = '出発時間（予定）' if is_dep else '到着時間（予定）'
-        actual_key = '出発時間（実際）' if is_dep else '到着時間（実際）'
-        status_key = '出発状態' if is_dep else '到着状態'
         loc_key = '目的地' if is_dep else '出発地'
+        st = self.flight_state(row, flight_type, now)
+        kind = (change or {}).get('kind', '')
+        prev_row = (change or {}).get('prev')
 
-        sched_raw = row.get(sched_key, '')
-        actual_raw = row.get(actual_key, '')
-        sched_dt = self._parse_hhmm(date_str, sched_raw)
-        actual_dt = self._parse_hhmm(date_str, actual_raw)
-        sched_txt = f"{sched_dt:%H:%M}" if sched_dt else (sched_raw if self._is_str(sched_raw) else "--:--")
-        ref = sched_dt.date() if sched_dt else None
-
-        # 状態（右端）
-        change_type = row.get('変更種別', '') if self._is_str(row.get('変更種別', '')) else ''
-        status_raw = row.get(status_key, '')
-        status_raw = status_raw.strip() if self._is_str(status_raw) else ''
-        cancelled = any(k in status_raw for k in ('欠航', '취소', 'Cancel', 'CANCEL'))
-        tag = "出発済" if is_dep else "到着済"
-        if cancelled:
-            status = "欠航"
-        elif actual_dt:
-            status = f"{tag} {actual_dt:%H:%M}"
-        elif self._is_str(actual_raw):
-            status = f"{tag} {actual_raw.strip()}"
-        elif any(k in status_raw for k in ('遅延', '지연', 'Delay')):
-            status = "遅延"
-        elif status_raw and not any(k in status_raw for k in ('予定', '정시', 'On Time', 'Scheduled')):
-            status = status_raw
+        # ICN 側の時刻（実績 > 見込み > 予定）。欠航は予定時刻を表示
+        icn_dt = st['time_dt'] or st['sched_dt']
+        if st['phase'] == 'done':
+            mark = " (実績)"
+        elif st['latest_dt'] and st['phase'] != 'cancelled':
+            mark = " (見込み)"
         else:
-            status = "定刻"
-        # 見やすい状態文（hourly_check の差分情報があれば前回値も添える）
-        kind = {'新規': 'new', '時間変更': 'changed'}.get(change_type, '')
-        prev_s = row.get('前回予定時間', '')
-        prev_a = row.get('前回実際時間', '')
-        sched_cmp = sched_raw.strip() if self._is_str(sched_raw) else ''
-        prev_sched = prev_s.strip() if self._is_str(prev_s) and prev_s.strip() != sched_cmp else None
-        prev_status = None
-        if kind == 'changed':
-            prev_status = f"{tag} {prev_a.strip()}" if self._is_str(prev_a) else "定刻"
-        status = self._pretty_status(status, sched_txt, is_dep, prev_status, prev_sched, kind)
+            mark = ""
+        icn_line = f"ICN {self._fmt_md(icn_dt)} {icn_dt:%H:%M} KST{mark}" if icn_dt else "ICN --/-- --:-- KST"
 
-        # 名古屋側の時刻
-        base = actual_dt or sched_dt
-        if cancelled or base is None:
-            ngo_dt = None
-        elif is_dep:
-            ngo_dt = base + timedelta(minutes=self.FLIGHT_MIN_ICN_NGO)
+        # 名古屋側の時刻（ICN 側の表示時刻 ± 標準所要時間）
+        if st['time_dt'] is None:
+            ngo_line = "NGO --/-- --:-- JST"
         else:
-            ngo_dt = base - timedelta(minutes=self.FLIGHT_MIN_NGO_ICN)
+            ngo_dt = st['time_dt'] + timedelta(minutes=self.FLIGHT_MIN_ICN_NGO) if is_dep \
+                else st['time_dt'] - timedelta(minutes=self.FLIGHT_MIN_NGO_ICN)
+            ngo_line = f"NGO {self._fmt_md(ngo_dt)} {ngo_dt:%H:%M} JST (推定)"
+        times = [f"`🛫 {icn_line}`", f"`🛬 {ngo_line}`"] if is_dep else [f"`🛫 {ngo_line}`", f"`🛬 {icn_line}`"]
 
         # 経路
         code, via = self._airport_code(row.get(loc_key, ''))
@@ -995,17 +1220,6 @@ class IncheonCargoScraper:
         else:
             route = (f"{code} → " if code and code != 'NGO' else "") + "NGO → ICN"
 
-        # 1 便 = 埋め込みフィールド 1 枠
-        badge = {"新規": "🆕 ", "時間変更": "🔔 "}.get(change_type, "")
-        icon = "🛫" if is_dep else "🛬"
-        fcode = self._flight_code(row.get('便名', ''))
-        name = f"{badge}{icon} {fcode} ｜ {self._day_label(date_str, today)}"
-        icn_line = f"ICN {self._fmt_md(sched_dt)} {sched_txt} KST"
-        ngo_line = "NGO --/-- --:-- JST" if ngo_dt is None else f"NGO {self._fmt_md(ngo_dt)} {ngo_dt:%H:%M} JST (推定)"
-        if is_dep:
-            times = [f"`🛫 {icn_line}`", f"`🛬 {ngo_line}`"]
-        else:
-            times = [f"`🛫 {ngo_line}`", f"`🛬 {icn_line}`"]
         # v3.02: ICN 側のターミナル・駐機場（駐機場は未割当なら '--'）
         terminal = row.get('ターミナル', '')
         stand = row.get('駐機場', '')
@@ -1014,111 +1228,32 @@ class IncheonCargoScraper:
             spot_parts.append(terminal.strip())
         spot_parts.append(f"駐機場 {stand.strip() if self._is_str(stand) else '--'}")
         spot_line = "`ICN " + " ・ ".join(spot_parts) + "`"
-        value = "\n".join([route, *times, spot_line, status])
+
+        # 状態文 + 変更内容
+        status_lines = [self._status_line(st, is_dep)]
+        if kind == 'new':
+            status_lines.append("🆕 新しく追加された便")
+        elif kind == 'removed':
+            status_lines.append("🗑️ スケジュールから削除された便")
+        elif kind in ('changed', 'moved') and prev_row is not None:
+            pst = self.flight_state(prev_row, flight_type, now)
+            if kind == 'moved':
+                prev_line = f"🔔 日付変更 ・ 前回: {self._fmt_md(pst['sched_dt'])} {pst['sched_txt'] or '--:--'}"
+                if pst['phase'] != 'scheduled':
+                    prev_line += " ・ " + self._status_line(pst, is_dep)
+                status_lines.append(prev_line)
+            else:
+                status_lines.append("🔔 前回: " + self._status_line(pst, is_dep, with_sched=(pst['sched_txt'] != st['sched_txt'])))
+
+        # 1 便 = 埋め込みフィールド 1 枠
+        badge = {'new': "🆕 ", 'changed': "🔔 ", 'moved': "🔔 ", 'removed': "🗑️ "}.get(kind, "")
+        icon = "🛫" if is_dep else "🛬"
+        fcode = self._flight_code(row.get('便名', ''))
+        name = f"{badge}{icon} {fcode} ｜ {self._day_label(date_str, today)}"
+        value = "\n".join([route, *times, spot_line, *status_lines])
         return {"name": name[:256], "value": value[:1024], "inline": False}
 
     # @function name:   _format_row
-    # @function end
-    # ======================================================================================#
-
-    # ======================================================================================#
-    # @function name:   _mins_diff
-    # @function start
-    @staticmethod
-    def _mins_diff(a, b):
-        """
-        ----------------------------------------------------------------------
-        関数概要：2 つの HH:MM の差分（分）を求める
-        - 例: '04:37' - '04:35' → +2
-        - 日またぎは ±12h 以内で補正
-        ----------------------------------------------------------------------
-        Args:
-            - a -> str --- 時刻（HH:MM）
-            - b -> str --- 基準時刻（HH:MM）
-        ----------------------------------------------------------------------
-        Returns:
-            - minutes -> int | None --- a - b の分差（変換不能時は None）
-        ----------------------------------------------------------------------
-        Notes:
-            - author         Kidera-Shunsuke
-            - revision       v3.00 (2026/11/08) - Changi 通知と共通の表形式に変更
-        ----------------------------------------------------------------------
-        """
-        try:
-            ha, ma = map(int, a[:5].split(":")); hb, mb = map(int, b[:5].split(":"))
-        except ValueError:
-            return None
-        d = (ha * 60 + ma) - (hb * 60 + mb)
-        if d > 720:
-            d -= 1440
-        elif d < -720:
-            d += 1440
-        return d
-
-    # @function name:   _mins_diff
-    # @function end
-    # ======================================================================================#
-
-    # ======================================================================================#
-    # @function name:   _pretty_status
-    # @function start
-    def _pretty_status(self, status, sched_txt, is_dep, prev_status, prev_sched, kind):
-        """
-        ----------------------------------------------------------------------
-        関数概要：内部状態を見やすい表示行に変換する
-        - 入力: '定刻' / '出発済 04:37' / '遅延' / '欠航' / その他
-        - 例: ✅ 出発済み 04:37（予定 04:35、+2分） / 🟢 定刻どおり
-        - 新規・変化がある場合は 2 行目に 🆕 / 🔔 の補足を付ける
-        ----------------------------------------------------------------------
-        Args:
-            - status -> str --- 内部状態文字列
-            - sched_txt -> str --- 予定時刻（HH:MM）
-            - is_dep -> bool --- 出発便かどうか
-            - prev_status -> str | None --- 前回通知時の状態
-            - prev_sched -> str | None --- 前回通知時の予定時刻
-            - kind -> str --- 変化種別（"" / "new" / "changed"）
-        ----------------------------------------------------------------------
-        Returns:
-            - line -> str --- 表示用文字列（1〜2 行）
-        ----------------------------------------------------------------------
-        Notes:
-            - author         Kidera-Shunsuke
-            - revision       v3.00 (2026/11/08) - Changi 通知と共通の表形式に変更
-        ----------------------------------------------------------------------
-        """
-        s = status.strip()
-        tag = "出発" if is_dep else "到着"
-
-        # 予定時刻との差分を '、+N分' / '、定刻' 形式で返す
-        def delta(tm):
-            d = self._mins_diff(tm, sched_txt)
-            if d is None:
-                return ""
-            return "、定刻" if d == 0 else f"、{d:+d}分"
-
-        # 状態別の 1 行目
-        if s == "定刻":
-            line = "🟢 定刻どおり"
-        elif s.startswith(("出発済", "到着済")):
-            actual = s.split(" ", 1)[1] if " " in s else ""
-            line = f"✅ {tag}済み {actual}（予定 {sched_txt}{delta(actual)}）" if actual else f"✅ {tag}済み"
-        elif s == "遅延":
-            line = "🟠 遅延"
-        elif s == "欠航":
-            line = "🔴 欠航"
-        else:
-            line = f"🔵 {s}"
-        # 新規・変化の補足（2 行目）
-        if kind == "new":
-            line += "\n🆕 新しく追加された便"
-        elif kind == "changed":
-            if prev_sched:
-                line += f"\n🔔 前回: 予定 {prev_sched}・{prev_status or '?'}"
-            else:
-                line += f"\n🔔 前回: {prev_status or '?'}"
-        return line
-
-    # @function name:   _pretty_status
     # @function end
     # ======================================================================================#
 
@@ -1184,7 +1319,7 @@ class IncheonCargoScraper:
     # ======================================================================================#
     # @function name:   _build_fields
     # @function start
-    def _build_fields(self, df, flight_type, today):
+    def _build_fields(self, df, flight_type, today, now=None):
         """
         ----------------------------------------------------------------------
         関数概要：便ごとの埋め込みフィールド一覧を組み立てる（日付・予定時刻順）
@@ -1194,6 +1329,7 @@ class IncheonCargoScraper:
             - df -> pd.DataFrame | None --- 便データ（None・空は 0 件扱い）
             - flight_type -> str --- フライトタイプ ('departure' or 'arrival')
             - today -> date --- 基準日
+            - now -> datetime | None --- 現在時刻（tz なし。flight_state の日付補正用）
         ----------------------------------------------------------------------
         Returns:
             - fields -> list[dict] --- 埋め込みフィールド一覧
@@ -1202,6 +1338,7 @@ class IncheonCargoScraper:
             - author         Kidera-Shunsuke
             - revision       v3.00 (2026/11/08) - Changi 通知と共通の表形式に変更
             - revision       v3.03 (2026/11/11) - 便間の空行を追加・空データに対応（Changi 通知に準拠）
+            - revision       v4.00 (2026/11/12) - now 引数を追加
         ----------------------------------------------------------------------
         """
         if df is None or len(df) == 0:
@@ -1211,7 +1348,7 @@ class IncheonCargoScraper:
         if '取得日' in df.columns:
             df = df.sort_values(['取得日', sched_key], kind='stable') if sched_key in df.columns else df.sort_values('取得日')
         for _, row in df.iterrows():
-            fields.append(self._format_row(row, flight_type, today))
+            fields.append(self._format_row(row, flight_type, today, now))
         # 便と便の間に 1 行空ける（最後の便には付けない）
         for fld in fields[:-1]:
             fld["value"] += "\n\u200b"
@@ -1283,30 +1420,54 @@ class IncheonCargoScraper:
     # ======================================================================================#
 
     # ======================================================================================#
-    # @function name:   _count_changes
+    # @function name:   _post_webhook
     # @function start
-    @classmethod
-    def _count_changes(cls, df):
+    def _post_webhook(self, payload, label=""):
         """
         ----------------------------------------------------------------------
-        関数概要：前回通知から変化した便（変更種別 = 新規 / 時間変更）の件数を数える
+        関数概要：Discord Webhook に 1 メッセージ送信する（レート制限時は待って再送）
         ----------------------------------------------------------------------
         Args:
-            - df -> pd.DataFrame | None --- 便データ（'変更種別' 列が無ければ 0 件）
+            - payload -> dict --- 送信内容（content / embeds）
+            - label -> str --- ログ表示用のラベル
         ----------------------------------------------------------------------
         Returns:
-            - count -> int --- 変化件数
+            - success -> bool --- 送信成功時 True
         ----------------------------------------------------------------------
         Notes:
             - author         Kidera-Shunsuke
-            - revision       v3.03 (2026/11/11) - 新規作成（Changi 通知に準拠）
+            - revision       v4.00 (2026/11/12) - 新規作成（一覧通知・個別通知で共用）
         ----------------------------------------------------------------------
         """
-        if df is None or len(df) == 0 or '変更種別' not in df.columns:
-            return 0
-        return sum(1 for v in df['変更種別'] if cls._is_str(v) and v.strip() in ('新規', '時間変更'))
+        try:
+            response = None
+            for _ in range(3):
+                response = requests.post(
+                    self.discord_webhook_url,
+                    json=payload,
+                    headers={'Content-Type': 'application/json'},
+                    timeout=10
+                )
+                if response.status_code != 429:
+                    break
+                # レート制限: 指定秒数（最大 10 秒）待って再送
+                try:
+                    wait = float(response.headers.get('Retry-After', '2'))
+                except ValueError:
+                    wait = 2.0
+                time.sleep(min(max(wait, 0.5), 10.0))
+            if response.status_code in (200, 204):
+                print(f"✓ Discord通知送信成功{label}")
+                return True
+            print(f"✗ エラー: Discord通知送信失敗{label}")
+            print(f"  ステータスコード: {response.status_code}")
+            print(f"  レスポンス: {response.text}")
+            return False
+        except requests.exceptions.RequestException as e:
+            print(f"✗ エラー: Discord通知送信中に通信エラー{label} - {e}")
+            return False
 
-    # @function name:   _count_changes
+    # @function name:   _post_webhook
     # @function end
     # ======================================================================================#
 
@@ -1316,12 +1477,13 @@ class IncheonCargoScraper:
     def send_discord_notification(self, df_departure, df_arrival, start_date, end_date, airport='NGO'):
         """
         ----------------------------------------------------------------------
-        関数概要：Discordに通知を送信（Changi 通知と同一フォーマット）
+        関数概要：Discordに一覧通知を送信（Changi 通知と同一フォーマット）
         - 出発便（青）・到着便（緑）の埋め込みを 1 メッセージにまとめて送信
-        - 1 便 = 埋め込みフィールド 1 枠。'変更種別' 列がある行は 🆕 / 🔔 を付けて前回値を添える
-        - 見出し: ICN ⇄ NGO カーゴ便  |  出発 N 件 / 到着 M 件  ・ 変化 K 件
+        - 1 便 = 埋め込みフィールド 1 枠
+        - 見出し: ICN ⇄ NGO カーゴ便  |  出発 N 件 / 到着 M 件
         - 名古屋側の時刻は標準所要時間からの推定
         - 24 フィールドごとに埋め込みを分割、10 embeds/message で送信
+        - 変更があった便の個別通知は send_change_notifications を使う
         ----------------------------------------------------------------------
         Args:
             - df_departure -> pd.DataFrame | None --- 出発便データ（None・空は「該当便なし」）
@@ -1338,6 +1500,7 @@ class IncheonCargoScraper:
             - revision       v3.00 (2026/11/08) - Changi 通知と共通の表形式に変更
             - revision       v3.03 (2026/11/11) - 出発便・到着便を 1 メッセージに統合し Changi 通知に完全準拠
                                                   （引数を df, flight_type → df_departure, df_arrival に変更）
+            - revision       v4.00 (2026/11/12) - 変化件数・🔔 表示を廃止（変更は個別通知に移行）
         ----------------------------------------------------------------------
         """
         if not self.discord_webhook_url:
@@ -1354,14 +1517,14 @@ class IncheonCargoScraper:
         try:
             now = datetime.now(self.JST)
             today = now.date()
-            dep_fields = self._build_fields(df_departure, 'departure', today)
-            arr_fields = self._build_fields(df_arrival, 'arrival', today)
-            n_changed = self._count_changes(df_departure) + self._count_changes(df_arrival)
+            now_naive = now.replace(tzinfo=None)
+            dep_fields = self._build_fields(df_departure, 'departure', today, now_naive)
+            arr_fields = self._build_fields(df_arrival, 'arrival', today, now_naive)
             period = f"{self._day_label(start_date, today)} 〜 {self._day_label(end_date, today)}"
             title = f"ICN ⇄ {airport} カーゴ便  |  出発 {n_dep} 件 / 到着 {n_arr} 件"
 
             # 標準出力表示
-            print(title, f"(変化 {n_changed} 件)" if n_changed else "")
+            print(title)
             print(f"対象期間: {period}")
             print(f"[出発便  ICN → {airport}]")
             print(self._fields_to_text(dep_fields))
@@ -1372,10 +1535,9 @@ class IncheonCargoScraper:
             embeds = self._embeds(f"出発便  ICN → {airport}  ({n_dep} 件)", dep_fields, self._color('DISCORD_COLOR_DEP', 0x3B82F6)) + \
                      self._embeds(f"到着便  {airport} → ICN  ({n_arr} 件)", arr_fields, self._color('DISCORD_COLOR_ARR', 0x22C55E))
             embeds[-1]["footer"] = {
-                "text": f"KST=韓国時間 / JST=日本時間 ・ 日付は各空港の現地日付 ・ 推定=標準所要時間からの概算 ・ 🔔=前回通知から変化 ・ 更新 {now:%m/%d %H:%M} JST"
+                "text": f"KST=韓国時間 / JST=日本時間 ・ 日付は各空港の現地日付 ・ 実績=出発/到着済みの時刻 ・ 見込み=変更後の予定時刻 ・ 推定=標準所要時間からの概算 ・ 更新 {now:%m/%d %H:%M} JST"
             }
-            chg = f"  ・ 変化 {n_changed} 件" if n_changed else ""
-            content = f"**{title}**{chg}\n対象期間: {period}"
+            content = f"**{title}**\n対象期間: {period}"
 
             MAX_EMBEDS_PER_MSG = 10
             print(f"  Webhook URL: {self.discord_webhook_url[:50]}...")
@@ -1386,22 +1548,8 @@ class IncheonCargoScraper:
                 payload = {"embeds": batch}
                 if batch_start == 0:
                     payload["content"] = content
-                response = requests.post(
-                    self.discord_webhook_url,
-                    json=payload,
-                    headers={'Content-Type': 'application/json'},
-                    timeout=10
-                )
-                if response.status_code == 429:
-                    time.sleep(float(response.headers.get('Retry-After', '2')))
-                    response = requests.post(self.discord_webhook_url, json=payload, timeout=10)
                 batch_num = batch_start // MAX_EMBEDS_PER_MSG + 1
-                if response.status_code in (200, 204):
-                    print(f"✓ Discord通知送信成功（バッチ {batch_num}）")
-                else:
-                    print(f"✗ エラー: Discord通知送信失敗（バッチ {batch_num}）")
-                    print(f"  ステータスコード: {response.status_code}")
-                    print(f"  レスポンス: {response.text}")
+                if not self._post_webhook(payload, f"（バッチ {batch_num}）"):
                     success = False
                 if batch_start + MAX_EMBEDS_PER_MSG < len(embeds):
                     time.sleep(0.5)
@@ -1416,6 +1564,112 @@ class IncheonCargoScraper:
             return False
 
     # @function name:   send_discord_notification
+    # @function end
+    # ======================================================================================#
+
+    # ======================================================================================#
+    # @function name:   _change_headline
+    # @function start
+    def _change_headline(self, change, airport, now=None):
+        """
+        ----------------------------------------------------------------------
+        関数概要：個別通知の本文（スマホの通知にも出る 2 行の要約）を作る
+        - 1 行目: **K4 217 ｜ ICN → NGO ｜ 11/13(金)**
+        - 2 行目: 変更内容（例: 🟠 遅延 → 17:05（予定 11:35、+330分））
+        ----------------------------------------------------------------------
+        Args:
+            - change -> dict --- 変更情報（flight_type / kind / row / prev）
+            - airport -> str --- 空港コード
+            - now -> datetime | None --- 現在時刻（tz なし）
+        ----------------------------------------------------------------------
+        Returns:
+            - content -> str --- メッセージ本文
+        ----------------------------------------------------------------------
+        Notes:
+            - author         Kidera-Shunsuke
+            - revision       v4.00 (2026/11/12) - 新規作成
+        ----------------------------------------------------------------------
+        """
+        flight_type, kind, row = change['flight_type'], change['kind'], change['row']
+        is_dep = (flight_type == 'departure')
+        st = self.flight_state(row, flight_type, now)
+        day = self._fmt_md(st['sched_dt']) if st['sched_dt'] else str(row.get('取得日', '') or '')
+        sched = st['sched_txt'] or "--:--"
+        route = f"ICN → {airport}" if is_dep else f"{airport} → ICN"
+        if kind == 'new':
+            summary = f"🆕 新しく追加された便（予定 {sched}）"
+        elif kind == 'removed':
+            summary = f"🗑️ スケジュールから削除された便（予定 {sched}）"
+        elif kind == 'moved' and change.get('prev') is not None:
+            pst = self.flight_state(change['prev'], flight_type, now)
+            summary = f"🔔 日付変更: {self._fmt_md(pst['sched_dt'])} {pst['sched_txt'] or '--:--'} → {day} {sched}"
+            if st['phase'] != 'scheduled':
+                summary += " ・ " + self._status_line(st, is_dep)
+        else:
+            summary = self._status_line(st, is_dep, with_sched=True)
+        return f"**{self._flight_code(row.get('便名', ''))} ｜ {route} ｜ {day}**\n{summary}"
+
+    # @function name:   _change_headline
+    # @function end
+    # ======================================================================================#
+
+    # ======================================================================================#
+    # @function name:   send_change_notifications
+    # @function start
+    def send_change_notifications(self, changes, airport='NGO'):
+        """
+        ----------------------------------------------------------------------
+        関数概要：変更があった便を 1 便 = 1 メッセージで Discord に個別通知する
+        - 本文: 便名・経路・日付と変更内容の要約（スマホの通知で内容が分かる）
+        - 埋め込み: 一覧通知と同じ 1 便分の枠（出発 = 青 / 到着 = 緑）+ 前回の状態
+        ----------------------------------------------------------------------
+        Args:
+            - changes -> list[dict] --- 変更情報のリスト。各要素は
+                  flight_type -> str  --- 'departure' or 'arrival'
+                  kind        -> str  --- 'new'（追加）/ 'changed'（時刻・状態の変更）/
+                                          'moved'（日付変更）/ 'removed'（削除）
+                  row         -> dict --- 今回のデータ行（removed は前回のデータ行）
+                  prev        -> dict | None --- 前回のデータ行（changed / moved）
+            - airport -> str --- 空港コード (デフォルト: NGO)
+        ----------------------------------------------------------------------
+        Returns:
+            - results -> list[bool] --- changes と同じ並びの送信結果
+        ----------------------------------------------------------------------
+        Notes:
+            - author         Kidera-Shunsuke
+            - revision       v4.00 (2026/11/12) - 新規作成（変更があった便の個別通知）
+        ----------------------------------------------------------------------
+        """
+        if not self.discord_webhook_url:
+            print("エラー: Discord Webhook URLが設定されていません")
+            return [False] * len(changes)
+
+        now = datetime.now(self.JST)
+        today = now.date()
+        now_naive = now.replace(tzinfo=None)
+        footer = f"KST=韓国時間 / JST=日本時間 ・ 実績=出発/到着済み ・ 見込み=変更後の予定 ・ 推定=標準所要時間からの概算 ・ 更新 {now:%m/%d %H:%M} JST"
+        results = []
+        for i, change in enumerate(changes):
+            try:
+                flight_type = change['flight_type']
+                is_dep = (flight_type == 'departure')
+                field = self._format_row(change['row'], flight_type, today, now_naive, change=change)
+                content = self._change_headline(change, airport, now_naive)
+                color = self._color('DISCORD_COLOR_DEP', 0x3B82F6) if is_dep else self._color('DISCORD_COLOR_ARR', 0x22C55E)
+                embed = {"title": field["name"], "description": field["value"], "color": color, "footer": {"text": footer}}
+
+                # 標準出力表示
+                print(content.replace("**", ""))
+                print(self._fields_to_text([field]))
+                results.append(self._post_webhook({"content": content, "embeds": [embed]}, f"（個別 {i + 1}/{len(changes)}）"))
+            except Exception as e:  # noqa: BLE001
+                print(f"✗ エラー: 個別通知の作成中に例外が発生 - {type(e).__name__}: {e}")
+                results.append(False)
+            if i + 1 < len(changes):
+                time.sleep(0.6)  # Webhook のレート制限（5 件 / 2 秒）を避ける
+        return results
+
+    # @function name:   send_change_notifications
     # @function end
     # ======================================================================================#
 
